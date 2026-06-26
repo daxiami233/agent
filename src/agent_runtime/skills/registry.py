@@ -27,8 +27,11 @@ from .manifest import SkillManifest
 
 
 # 默认系统提示词模板
-# 使用 {skills}、{retrieved_memory}、{conversation_summary} 作为占位符
+# 使用 {tools}、{skills}、{retrieved_memory}、{conversation_summary} 作为占位符
 DEFAULT_SYSTEM_PROMPT = """You are Agent Runtime, a local agent. Answer in Chinese. Be concise, accurate, and actionable.
+
+# Tools
+{tools}
 
 # Skills
 Use available tools and skills when they help. After receiving tool results, answer the user directly.
@@ -113,14 +116,25 @@ class SkillRegistry:
         """
         prompt = (system_prompt or DEFAULT_SYSTEM_PROMPT).strip()
         skills = self.list()
+        user_skills = [
+            skill
+            for skill in skills
+            if getattr(skill, "source", "user") != "system"
+        ]
 
         if not skills:
-            # 没有技能，移除 {skills} 相关内容
-            # 保留 "# Skills" 标题，但内容为空
-            prompt = prompt.replace("{skills}", "")
+            prompt = prompt.replace(
+                "{skills}",
+                "No skills are currently available.",
+            )
         else:
-            # 有技能，生成技能列表
-            lines = ["", "# Available Skills"]
+            lines = []
+            if not user_skills:
+                lines.append(
+                    "No user-defined skills are loaded. Built-in system skills are still available."
+                )
+                lines.append("")
+            lines.append("# Available Skills")
             for skill in skills:
                 lines.append(f"- {skill.name}: {skill.description}")
             skills_text = "\n".join(lines)

@@ -7,7 +7,7 @@ from pathlib import Path
 from .manifest import SkillManifest
 
 
-def load_skill(path: Path | str) -> SkillManifest:
+def load_skill(path: Path | str, *, source: str = "user") -> SkillManifest:
     """Load one skill directory containing a SKILL.md file."""
 
     skill_dir = Path(path).expanduser().resolve()
@@ -25,21 +25,22 @@ def load_skill(path: Path | str) -> SkillManifest:
         context_files=_list_value(metadata.get("context_files")),
         required_tools=_list_value(metadata.get("required_tools")),
         skill_dir=skill_dir,
+        source=source,
     )
 
 
-def load_skills(path: Path | str) -> list[SkillManifest]:
+def load_skills(path: Path | str, *, source: str = "user") -> list[SkillManifest]:
     """Load all direct child skill directories under path."""
 
     root = Path(path).expanduser().resolve()
     if not root.exists():
         return []
     if (root / "SKILL.md").is_file():
-        return [load_skill(root)]
+        return [load_skill(root, source=source)]
     skills: list[SkillManifest] = []
     for child in sorted(root.iterdir()):
         if child.is_dir() and (child / "SKILL.md").is_file():
-            skills.append(load_skill(child))
+            skills.append(load_skill(child, source=source))
     return skills
 
 

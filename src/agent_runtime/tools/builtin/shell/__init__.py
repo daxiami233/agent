@@ -10,7 +10,7 @@ from typing import Any
 
 from agent_runtime.logging import redact_sensitive_text, runtime_log
 
-from .registry import ToolSpec
+from agent_runtime.tools.registry import ToolSpec
 
 
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
@@ -101,8 +101,8 @@ def shell_command_tool(
                     "command": command,
                     "cwd": str(cwd),
                     "exit_code": completed.returncode,
-                    "stdout_preview": stdout[:500],
-                    "stderr_preview": stderr[:500],
+                    "stdout_chars": len(stdout),
+                    "stderr_chars": len(stderr),
                     "stdout_truncated": stdout_truncated,
                     "stderr_truncated": stderr_truncated,
                 },
@@ -134,8 +134,8 @@ def shell_command_tool(
                     "command": command,
                     "cwd": str(cwd),
                     "timeout_seconds": timeout,
-                    "stdout_preview": stdout[:500],
-                    "stderr_preview": stderr[:500],
+                    "stdout_chars": len(stdout),
+                    "stderr_chars": len(stderr),
                     "stdout_truncated": stdout_truncated,
                     "stderr_truncated": stderr_truncated,
                 },

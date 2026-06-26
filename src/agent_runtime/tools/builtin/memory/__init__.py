@@ -6,7 +6,7 @@ from typing import Any
 
 from agent_runtime.memory import LongTermMemoryProtocol
 
-from .registry import ToolSpec
+from agent_runtime.tools.registry import ToolSpec
 
 
 def memory_tools(memory: LongTermMemoryProtocol) -> list[ToolSpec]:

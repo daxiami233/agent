@@ -15,6 +15,8 @@ from agent_runtime.tools import ToolRegistry
 
 
 MAX_IDENTICAL_TOOL_CALLS = 2
+DUPLICATE_WARNING_THRESHOLD = 1
+MAX_DUPLICATE_BLOCKS = 3
 
 
 @dataclass(slots=True)
@@ -34,6 +36,7 @@ class _ModelTurnResult:
     steps: list[dict[str, Any]] = field(default_factory=list)
     finish_status: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
     was_cancelled: bool = False
     failed: bool = False
 
@@ -55,7 +58,8 @@ class AgentLoop:
         self.tool_registry = tool_registry
         self.log_context = log_context or self._log_model_context
         self.model_timeout_seconds = model_timeout_seconds
-        self.last_usage: dict[str, Any] = {}
+        self._compress_events: list[str] = []
+        self.context.on_compress = self._on_compress
         runtime_log(
             "agent_loop_init",
             {
@@ -80,6 +84,9 @@ class AgentLoop:
         all_reasoning_parts: list[str] = []
         final_assistant_text = ""
         tool_call_counts: dict[tuple[str, str], int] = {}
+        next_round_tool_blocks: set[str] = set()
+        next_round_reminders: list[str] = []
+        duplicate_block_count = 0
         runtime_log(
             "agent_run_start",
             {
@@ -98,10 +105,16 @@ class AgentLoop:
                     "round_index": round_index,
                 },
             )
+            blocked_tools = next_round_tool_blocks
+            reminders = next_round_reminders
+            next_round_tool_blocks = set()
+            next_round_reminders = []
+            active_tools = self._filter_tools(tools, blocked_tools)
             result = yield from self._stream_model_once(
                 conversation_id,
                 reasoning_enabled=reasoning_enabled,
-                tools=tools,
+                tools=active_tools,
+                extra_messages=self._reminder_messages(reminders),
                 is_cancelled=cancelled,
             )
 
@@ -139,19 +152,16 @@ class AgentLoop:
                 return
 
             if result.tool_calls:
-                repeated_call = self._first_repeated_tool_call(
+                repeated_call, warning_calls = self._check_repeated_tool_calls(
                     result.tool_calls,
                     tool_call_counts,
                 )
                 if repeated_call is not None:
-                    # Keep the first safety policy simple: stop after the same
-                    # tool receives the same arguments too many times in one run.
                     runtime_log(
-                        "agent_repeated_tool_call_limit",
+                        "agent_repeated_tool_call_blocked",
                         {
                             "conversation_id": conversation_id,
                             "round_index": round_index,
-                            "max_identical_tool_calls": MAX_IDENTICAL_TOOL_CALLS,
                             "tool_call": {
                                 "id": repeated_call.id,
                                 "name": repeated_call.name,
@@ -159,14 +169,33 @@ class AgentLoop:
                             },
                         },
                     )
-                    yield AgentEvent(
-                        "notice",
-                        {
-                            "tone": "error",
-                            "text": "检测到重复工具调用，已停止继续调用。",
-                        },
+                    duplicate_block_count += 1
+                    if duplicate_block_count >= MAX_DUPLICATE_BLOCKS:
+                        yield AgentEvent(
+                            "notice",
+                            {
+                                "tone": "error",
+                                "text": "检测到重复工具调用，已停止继续调用。",
+                            },
+                        )
+                        return
+                    next_round_tool_blocks.add(repeated_call.name)
+                    next_round_reminders.append(
+                        self._duplicate_call_reminder(repeated_call.name)
                     )
-                    return
+                    round_index += 1
+                    continue
+                if warning_calls:
+                    for wc in warning_calls:
+                        next_round_reminders.append(self._duplicate_call_reminder(wc.name))
+                        runtime_log(
+                            "agent_repeated_tool_call_warning",
+                            {
+                                "conversation_id": conversation_id,
+                                "round_index": round_index,
+                                "tool_name": wc.name,
+                            },
+                        )
                 self.context.add_assistant_message(
                     conversation_id,
                     final_assistant_text,
@@ -179,6 +208,7 @@ class AgentLoop:
                 )
                 tool_steps = yield from self._execute_tool_calls(conversation_id, result.tool_calls)
                 execution_steps.extend(tool_steps)
+                duplicate_block_count = 0
                 round_index += 1
                 continue
 
@@ -198,14 +228,14 @@ class AgentLoop:
                     "\n".join(all_reasoning_parts),
                     execution_steps,
                 )
-            yield AgentEvent("usage", {"usage": self.last_usage})
+            yield AgentEvent("usage", {"usage": result.usage})
             runtime_log(
                 "agent_run_complete",
                 {
                     "conversation_id": conversation_id,
                     "round_index": round_index,
                     "finish_status": result.finish_status,
-                    "usage": self.last_usage,
+                    "usage": result.usage,
                     "assistant_text_preview": self._summarize_value(final_assistant_text),
                 },
             )
@@ -245,18 +275,26 @@ class AgentLoop:
         *,
         reasoning_enabled: bool,
         tools: list[dict[str, Any]],
+        extra_messages: list[dict[str, Any]] | None = None,
         is_cancelled: Callable[[], bool],
     ) -> Iterator[AgentEvent]:
         assistant_started = False
         assistant_parts: list[str] = []
         reasoning_parts: list[str] = []
         finish_status = None
+        usage: dict[str, Any] = {}
         tool_calls: list[ToolCall] = []
         was_cancelled = False
         model_input = self.context.build_model_input(
             conversation_id,
-            extra_input_tokens=self._tools_token_count(tools),
+            extra_input_tokens=(
+                self._tools_token_count(tools)
+                + self._model_messages_token_count(extra_messages or [])
+            ),
         )
+        if extra_messages:
+            model_input = [*model_input, *extra_messages]
+        yield from self._drain_compress_events()
         self.log_context(conversation_id, model_input)
         runtime_log(
             "model_request",
@@ -284,15 +322,6 @@ class AgentLoop:
                     break
                 if event.tool_call is not None:
                     tool_calls.append(event.tool_call)
-                    runtime_log(
-                        "model_tool_call_delta",
-                        {
-                            "conversation_id": conversation_id,
-                            "id": event.tool_call.id,
-                            "name": event.tool_call.name,
-                            "arguments": event.tool_call.arguments,
-                        },
-                    )
                     continue
                 if self._is_reasoning_event(event) and event.delta:
                     if not reasoning_enabled:
@@ -309,7 +338,7 @@ class AgentLoop:
                     continue
                 if event.type == "finish" and event.response is not None:
                     finish_status = event.response.finish_reason
-                    self.last_usage = event.response.usage
+                    usage = event.response.usage
                     tool_calls.extend(event.response.tool_calls)
                     if event.response.content and not assistant_started:
                         yield AgentEvent("assistant_start", {})
@@ -337,14 +366,10 @@ class AgentLoop:
             {
                 "conversation_id": conversation_id,
                 "finish_status": finish_status,
-                "assistant_text_preview": self._summarize_value("".join(assistant_parts)),
                 "reasoning_chars": len(reasoning_text),
-                "tool_calls": [
-                    {"id": call.id, "name": call.name, "arguments": call.arguments}
-                    for call in tool_calls
-                ],
+                "tool_call_count": len(tool_calls),
                 "was_cancelled": was_cancelled,
-                "usage": self.last_usage,
+                "usage": usage,
             },
         )
         return _ModelTurnResult(
@@ -365,6 +390,7 @@ class AgentLoop:
             ),
             finish_status=finish_status,
             tool_calls=tool_calls,
+            usage=usage,
             was_cancelled=was_cancelled,
         )
 
@@ -383,8 +409,6 @@ class AgentLoop:
                     "conversation_id": conversation_id,
                     "id": call.id,
                     "name": call.name,
-                    "arguments": arguments,
-                    "arguments_summary": arguments_summary,
                 },
             )
             yield AgentEvent(
@@ -415,8 +439,6 @@ class AgentLoop:
                     "id": call.id,
                     "name": call.name,
                     "status": status,
-                    "arguments_summary": arguments_summary,
-                    "result_summary": result_summary,
                 },
             )
             self.context.add_tool_result(
@@ -452,17 +474,27 @@ class AgentLoop:
             )
         return steps
 
-    def _first_repeated_tool_call(
+    def _check_repeated_tool_calls(
         self,
         tool_calls: list[ToolCall],
         counts: dict[tuple[str, str], int],
-    ) -> ToolCall | None:
+    ) -> tuple[ToolCall | None, list[ToolCall]]:
+        """Two-level duplicate detection.
+
+        Returns (blocked_call, warning_calls):
+        - blocked_call: the call that exceeded MAX_IDENTICAL_TOOL_CALLS (should block tool)
+        - warning_calls: calls that exceeded DUPLICATE_WARNING_THRESHOLD but not max (inject warning)
+        """
+        blocked: ToolCall | None = None
+        warnings: list[ToolCall] = []
         for call in tool_calls:
             key = self._tool_call_key(call)
             counts[key] = counts.get(key, 0) + 1
-            if counts[key] > MAX_IDENTICAL_TOOL_CALLS:
-                return call
-        return None
+            if counts[key] > MAX_IDENTICAL_TOOL_CALLS and blocked is None:
+                blocked = call
+            elif counts[key] > DUPLICATE_WARNING_THRESHOLD and counts[key] <= MAX_IDENTICAL_TOOL_CALLS:
+                warnings.append(call)
+        return blocked, warnings
 
     def _tool_call_key(self, call: ToolCall) -> tuple[str, str]:
         try:
@@ -501,6 +533,41 @@ class AgentLoop:
             text = str(tools)
         return self.context.token_counter.count_text(text)
 
+    def _model_messages_token_count(self, messages: list[dict[str, Any]]) -> int:
+        if not messages:
+            return 0
+        try:
+            text = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            text = str(messages)
+        return self.context.token_counter.count_text(text)
+
+    def _filter_tools(
+        self,
+        tools: list[dict[str, Any]],
+        blocked_names: set[str],
+    ) -> list[dict[str, Any]]:
+        if not blocked_names:
+            return tools
+        return [
+            tool
+            for tool in tools
+            if str(tool.get("function", {}).get("name", "")) not in blocked_names
+        ]
+
+    def _reminder_messages(self, reminders: list[str]) -> list[dict[str, Any]]:
+        return [
+            {"role": "system", "content": reminder}
+            for reminder in reminders
+            if reminder.strip()
+        ]
+
+    def _duplicate_call_reminder(self, tool_name: str) -> str:
+        return (
+            f"Duplicate call detected for {tool_name} with the same arguments. "
+            "Do not call it again. Continue using the existing result."
+        )
+
     def _summarize_value(self, value: Any, limit: int = 220) -> str:
         if isinstance(value, str):
             text = value
@@ -514,6 +581,23 @@ class AgentLoop:
             return text
         return f"{text[: limit - 3]}..."
 
+    def _on_compress(self, stage: str) -> None:
+        self._compress_events.append(stage)
+
+    def _drain_compress_events(self) -> Iterator[AgentEvent]:
+        while self._compress_events:
+            stage = self._compress_events.pop(0)
+            if stage == "start":
+                yield AgentEvent(
+                    "notice",
+                    {"tone": "muted", "text": "正在压缩上下文..."},
+                )
+            elif stage == "done":
+                yield AgentEvent(
+                    "notice",
+                    {"tone": "muted", "text": "上下文压缩完成"},
+                )
+
     def _log_model_context(
         self,
         conversation_id: str,
@@ -524,20 +608,6 @@ class AgentLoop:
             {
                 "conversation_id": conversation_id,
                 "message_count": len(model_input),
-                "messages": [
-                    {
-                        "role": str(message.get("role", "")),
-                        "content_preview": self._summarize_value(
-                            message.get("content", ""),
-                            limit=320,
-                        ),
-                        "extra_keys": sorted(
-                            key
-                            for key in message
-                            if key not in {"role", "content"}
-                        ),
-                    }
-                    for message in model_input
-                ],
+                "roles": [str(m.get("role", "")) for m in model_input],
             },
         )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from agent_runtime.context import (
     CompressionResult,
     ContextCompressor,
@@ -146,7 +148,7 @@ def test_context_engine_fills_system_prompt_placeholders(tmp_path):
     system = context.build_model_input("conversation-1")[0]
 
     assert system["content"] == (
-        "Skills:\n\nMemory:\nremember this\nand this\n\nSummary:\nNone."
+        "Skills:\n\nMemory:\nremember this\nand this\n\nSummary:\nNo memories stored yet."
     )
 
 
@@ -160,7 +162,7 @@ def test_context_engine_uses_empty_memory_text_when_memory_is_empty(tmp_path):
 
     assert context.build_model_input("conversation-1")[0] == {
         "role": "system",
-        "content": "Memory: None.",
+        "content": "Memory: No memories stored yet.",
     }
 
 
@@ -398,6 +400,66 @@ def test_context_engine_preserves_all_messages(tmp_path):
     assert messages[2]["role"] == "tool"
     assert messages[3]["role"] == "user"
     assert messages[3]["content"] == "b" * 10
+
+
+def test_context_engine_repairs_assistant_tool_calls_without_results(tmp_path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    context = ContextEngine(store, system_prompt="sys")
+    store.append_message(
+        "conversation-1",
+        "assistant",
+        json.dumps(
+            {
+                "text": "I looked.",
+                "tool_calls": [
+                    {"id": "call_missing", "name": "tool", "arguments": {}}
+                ],
+            }
+        ),
+    )
+    store.append_message("conversation-1", "assistant", "final answer")
+
+    messages = without_system(context.build_model_input("conversation-1"))
+
+    assert messages == [
+        {"role": "assistant", "content": "I looked."},
+        {"role": "assistant", "content": "final answer"},
+    ]
+    assert [
+        message.role
+        for message in store.list_messages("conversation-1")
+    ] == ["assistant", "assistant"]
+
+
+def test_context_engine_force_truncates_tool_call_groups_atomically(tmp_path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    context = ContextEngine(
+        store,
+        system_prompt="sys",
+        context_window_tokens=20,
+        reserved_output_tokens=0,
+        safety_margin_tokens=0,
+        token_counter=SimpleTokenCounter(),
+    )
+    context.add_user_message("conversation-1", "x" * 80)
+    context.add_assistant_message(
+        "conversation-1",
+        "",
+        tool_calls=[{"id": "call_1", "name": "tool", "arguments": {}}],
+    )
+    context.add_tool_result(
+        "conversation-1",
+        "tool",
+        {},
+        {"result": "y" * 80},
+        call_id="call_1",
+    )
+
+    messages = without_system(context.build_model_input("conversation-1"))
+
+    assert [message["role"] for message in messages] == ["assistant", "tool"]
+    assert messages[0]["tool_calls"][0]["id"] == "call_1"
+    assert messages[1]["tool_call_id"] == "call_1"
 
 
 def test_context_engine_calls_compressor_when_over_budget(tmp_path):

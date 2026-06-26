@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -29,6 +31,7 @@ from .commands import (
 
 STATE_DIR = Path.home() / ".agent-runtime"
 HISTORY_DIR = STATE_DIR / "history"
+PROJECT_DB = STATE_DIR / "web_projects.sqlite3"
 
 
 @dataclass(slots=True)
@@ -37,6 +40,179 @@ class WebEvent:
 
     type: str
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ProjectRecord:
+    """Web-layer project metadata. Agent core only sees conversation ids."""
+
+    id: str
+    name: str
+    path: str
+    created_at: float
+    updated_at: float
+    last_opened_at: float
+
+
+class WebProjectStore:
+    """Persist project and project-conversation mapping outside agent core."""
+
+    def __init__(self, path: Path | str = PROJECT_DB) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+
+    def ensure_project(self, path: Path | str, name: str | None = None) -> ProjectRecord:
+        project_path = str(Path(path).expanduser().resolve())
+        project_id = sha1(project_path.encode("utf-8")).hexdigest()[:16]
+        now = time.time()
+        project_name = name or Path(project_path).name or project_path
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO projects (id, name, path, created_at, updated_at, last_opened_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    path = excluded.path,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, project_name, project_path, now, now, 0.0),
+            )
+            row = conn.execute(
+                """
+                SELECT id, name, path, created_at, updated_at, last_opened_at
+                FROM projects
+                WHERE id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return self._project_from_row(row)
+
+    def list_projects(self) -> list[ProjectRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, path, created_at, updated_at, last_opened_at
+                FROM projects
+                ORDER BY last_opened_at DESC, updated_at DESC, created_at DESC
+                """
+            ).fetchall()
+        return [self._project_from_row(row) for row in rows]
+
+    def get_project(self, project_id: str) -> ProjectRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, name, path, created_at, updated_at, last_opened_at
+                FROM projects
+                WHERE id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return self._project_from_row(row) if row is not None else None
+
+    def touch_project(self, project_id: str) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE projects
+                SET last_opened_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, project_id),
+            )
+
+    def link_conversation(self, project_id: str, conversation_id: str) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO project_conversations
+                    (project_id, conversation_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (project_id, conversation_id, now),
+            )
+
+    def unlink_conversation(self, conversation_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM project_conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+
+    def delete_project(self, project_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        return cursor.rowcount > 0
+
+    def conversation_ids(self, project_id: str) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT conversation_id
+                FROM project_conversations
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                """,
+                (project_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def conversation_count(self, project_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM project_conversations
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_opened_at REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_conversations (
+                    project_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (project_id, conversation_id),
+                    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _project_from_row(self, row: sqlite3.Row | tuple[object, ...]) -> ProjectRecord:
+        return ProjectRecord(
+            id=str(row[0]),
+            name=str(row[1]),
+            path=str(row[2]),
+            created_at=float(row[3]),
+            updated_at=float(row[4]),
+            last_opened_at=float(row[5]),
+        )
 
 
 class WebSession:
@@ -51,6 +227,7 @@ class WebSession:
         skills: list[SkillManifest] | None = None,
         skill_registry: SkillRegistry | None = None,
         mcp_host: MCPClientHost | None = None,
+        project_store: WebProjectStore | None = None,
         include_memory_tools: bool = True,
         include_skill_tools: bool = True,
         include_shell_tool: bool = True,
@@ -64,6 +241,10 @@ class WebSession:
         self.tool_registry = tool_registry or ToolRegistry()
         self.skill_registry = skill_registry or SkillRegistry(skills or [])
         self.mcp_host = mcp_host or MCPClientHost()
+        self.project_store = project_store or WebProjectStore(
+            self._default_project_store_path(self.memory_store)
+        )
+        self.default_project = self.project_store.ensure_project(Path.cwd())
         self.agent: Agent | None = None
         self.commands = self._build_commands()
         self.should_shutdown = False
@@ -72,10 +253,11 @@ class WebSession:
         runtime_log(
             "web_session_init",
             {
-                "include_memory_tools": include_memory_tools,
-                "include_skill_tools": include_skill_tools,
-                "include_shell_tool": include_shell_tool,
-            },
+                    "include_memory_tools": include_memory_tools,
+                    "include_skill_tools": include_skill_tools,
+                    "include_shell_tool": include_shell_tool,
+                    "default_project": self.default_project.path,
+                },
         )
         try:
             self.provider = self.provider_factory()
@@ -138,18 +320,62 @@ class WebSession:
             *self._drain_output_events(),
         ]
 
-    def list_conversations(self) -> list[dict[str, Any]]:
-        return [self._conversation_payload(record.id) for record in self.memory_store.list_conversations()]
+    def list_projects(self) -> list[dict[str, Any]]:
+        return [self._project_payload(project) for project in self.project_store.list_projects()]
+
+    def add_project(self, path: Path | str, name: str | None = None) -> dict[str, Any]:
+        raw_path = str(path).strip()
+        if not raw_path:
+            raise ValueError("Project path is required")
+        project_path = Path(raw_path).expanduser().resolve()
+        if not project_path.is_dir():
+            raise ValueError(f"Project path is not a directory: {project_path}")
+        project = self.project_store.ensure_project(project_path, name)
+        self.project_store.touch_project(project.id)
+        project = self.project_store.get_project(project.id) or project
+        return self._project_payload(project)
+
+    def select_project(self, project_id: str) -> dict[str, Any]:
+        project = self.project_store.get_project(project_id)
+        if project is None:
+            raise ValueError(f"Project not found: {project_id}")
+        self.project_store.touch_project(project_id)
+        project = self.project_store.get_project(project_id) or project
+        return {
+            "project": self._project_payload(project),
+            "conversations": self.list_conversations(project_id),
+        }
+
+    def delete_project(self, project_id: str) -> None:
+        if not self.project_store.delete_project(project_id):
+            raise ValueError(f"Project not found: {project_id}")
+
+    def list_conversations(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        if project_id:
+            ids = set(self.project_store.conversation_ids(project_id))
+            return [
+                self._conversation_payload(record.id)
+                for record in self.memory_store.list_conversations()
+                if record.id in ids
+            ]
+        return [
+            self._conversation_payload(record.id)
+            for record in self.memory_store.list_conversations()
+        ]
 
     def create_conversation(
         self,
         conversation_id: str | None = None,
         title: str = "新对话",
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         record = self.memory_store.create_conversation(conversation_id or str(uuid4()), title)
+        if project_id:
+            self.project_store.link_conversation(project_id, record.id)
         return self._conversation_payload(record.id)
 
     def delete_conversation(self, conversation_id: str) -> None:
+        self.project_store.unlink_conversation(conversation_id)
         self.memory_store.delete_conversation(conversation_id)
 
     def submit(
@@ -263,16 +489,6 @@ class WebSession:
                 )
                 yield WebEvent("status", self._context_window_payload(conversation_id))
                 continue
-            if event.type in {"notice", "tool_call_start", "tool_call_result"}:
-                runtime_log(
-                    "web_stream_event",
-                    {
-                        "conversation_id": conversation_id,
-                        "request_id": request_id,
-                        "event_type": event.type,
-                        "payload_summary": self._summarize_value(event.payload),
-                    },
-                )
             yield WebEvent(event.type, event.payload)
 
         yield from self._drain_output_events()
@@ -392,10 +608,7 @@ class WebSession:
                     pending_tools = []
                 text, reasoning, steps = self._parse_assistant_content(message.content)
                 if text:
-                    existing_text = str(current_assistant.get("text", ""))
-                    current_assistant["text"] = (
-                        f"{existing_text}\n\n{text}" if existing_text else text
-                    )
+                    current_assistant["text"] = text
                 else:
                     current_assistant.setdefault("text", "")
                 if reasoning:
@@ -434,6 +647,23 @@ class WebSession:
             **self._context_window_payload(record.id),
             "messages": messages,
         }
+
+    def _project_payload(self, project: ProjectRecord) -> dict[str, Any]:
+        return {
+            "id": project.id,
+            "name": project.name,
+            "path": project.path,
+            "createdAt": project.created_at,
+            "updatedAt": project.updated_at,
+            "lastOpenedAt": project.last_opened_at,
+            "conversationCount": self.project_store.conversation_count(project.id),
+        }
+
+    def _default_project_store_path(self, memory_store: Any) -> Path:
+        path = getattr(memory_store, "path", None)
+        if path is None:
+            return PROJECT_DB
+        return Path(path).with_name("web_projects.sqlite3")
 
     def _parse_assistant_content(self, content: str) -> tuple[str, str, list[dict[str, Any]]]:
         try:
@@ -484,16 +714,23 @@ class WebSession:
                 "contextWindow": None,
             }
 
+        has_messages = bool(conversation_id and self.memory_store.message_count(conversation_id) > 0)
         budget = self.context.context_budget(
             conversation_id or "",
             extra_input_tokens=self._tool_schema_tokens(),
         )
-        used = budget.used_input_tokens
         input_budget = budget.input_budget_tokens
+        if not has_messages:
+            return {
+                **budget.to_payload(),
+                "context": f"输入上下文：0 / {self._format_tokens(input_budget)}",
+                "contextUsed": 0,
+            }
+        used = self.context.conversation_tokens(conversation_id)
         return {
+            **budget.to_payload(),
             "context": f"输入上下文：{self._format_tokens(used)} / {self._format_tokens(input_budget)}",
             "contextUsed": used,
-            **budget.to_payload(),
         }
 
     def _tool_schema_tokens(self) -> int:

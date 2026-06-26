@@ -1,12 +1,15 @@
 """Tool specifications and registry."""
 
-from .memory import (
+from .builtin.list_skills import list_skills_tool
+from .builtin.memory import (
     memory_append_tool,
     memory_read_tool,
     memory_replace_tool,
     memory_search_tool,
     memory_tools,
 )
+from .builtin.shell import shell_command_tool
+from .builtin.skills_tool import skill_read_resource_tool, skill_read_tool, skill_tools
 from .registry import (
     ToolArgumentError,
     ToolAlreadyRegisteredError,
@@ -17,8 +20,6 @@ from .registry import (
     tool,
     tool_from_function,
 )
-from .shell import shell_command_tool
-from .skills import skill_read_resource_tool, skill_read_tool, skill_tools
 
 
 def built_in_tool_registry() -> ToolRegistry:
@@ -39,6 +40,7 @@ __all__ = [
     "ToolRegistryError",
     "ToolSpec",
     "built_in_tool_registry",
+    "list_skills_tool",
     "memory_append_tool",
     "memory_read_tool",
     "memory_replace_tool",

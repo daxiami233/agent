@@ -12,15 +12,47 @@ export async function fetchConversations() {
   return requestJson("/api/conversations", {}, "加载对话失败");
 }
 
+export async function fetchProjects() {
+  return requestJson("/api/projects", {}, "加载项目失败");
+}
+
 export async function fetchRuntimeLog() {
   return requestJson("/api/logs/runtime", {}, "加载运行日志失败");
 }
 
-export async function createConversation(title = "新对话") {
+export async function clearRuntimeLog() {
+  return requestJson("/api/logs/runtime", {
+    method: "DELETE",
+  }, "清空运行日志失败");
+}
+
+export async function createProject(path, name = "") {
+  return requestJson("/api/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, name: name || null }),
+  }, "添加项目失败");
+}
+
+export async function pickProject() {
+  return requestJson("/api/projects/pick", {
+    method: "POST",
+  }, "打开项目失败");
+}
+
+export async function selectProject(projectId) {
+  return requestJson("/api/projects/select", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId }),
+  }, "选择项目失败");
+}
+
+export async function createConversation(title = "新对话", projectId = "") {
   return requestJson("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title }),
+    body: JSON.stringify({ title, project_id: projectId || null }),
   }, "创建对话失败");
 }
 
@@ -28,6 +60,12 @@ export async function deleteConversation(conversationId) {
   return requestJson(`/api/conversations/${encodeURIComponent(conversationId)}`, {
     method: "DELETE",
   }, "删除对话失败");
+}
+
+export async function deleteProject(projectId) {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  }, "移除项目失败");
 }
 
 export async function sendChat(conversationId, message, requestId, reasoningEnabled, controller, onEvent) {
@@ -59,7 +97,14 @@ export async function cancelGeneration(requestId) {
 async function requestJson(url, options = {}, label = "请求失败") {
   const response = await fetch(url, options);
   if (!response.ok) {
-    throw new Error(`${label}：${response.status}`);
+    let detail = "";
+    try {
+      const payload = await response.json();
+      detail = payload.error || payload.detail || "";
+    } catch {
+      detail = "";
+    }
+    throw new Error(`${label}：${detail || response.status}`);
   }
   return response.json();
 }
@@ -101,7 +146,16 @@ export function applyEvent(event, setMessages, setStatus) {
   if (event.type === "assistant_start") {
     setMessages((items) => {
       const last = items[items.length - 1];
-      if (last?.role === "assistant" && !last.streamComplete) return items;
+      if (last?.role === "assistant" && !last.streamComplete) {
+        const next = [...items];
+        next[next.length - 1] = {
+          ...last,
+          text: "",
+          noticeText: "",
+          streamComplete: false,
+        };
+        return next;
+      }
       return [...items, createAssistantMessage()];
     });
     return;
@@ -187,7 +241,7 @@ export function applyEvent(event, setMessages, setStatus) {
       updateCurrentAssistant(items, (m) =>
         finalizeAssistantMessage({
           ...m,
-          text: m.text ? `${m.text}\n${event.text}` : event.text,
+          noticeText: event.text,
         }),
       ),
     );
@@ -199,7 +253,7 @@ export function applyEvent(event, setMessages, setStatus) {
         updateCurrentAssistant(items, (m) =>
           finalizeAssistantMessage({
             ...m,
-            text: m.text ? `${m.text}\n${event.text}` : event.text,
+            noticeText: event.text,
           }),
         ),
       );
@@ -255,6 +309,7 @@ function createAssistantMessage() {
     id: uid(),
     role: "assistant",
     text: "",
+    noticeText: "",
     reasoning: "",
     reasoningOpen: true,
     reasoningComplete: false,

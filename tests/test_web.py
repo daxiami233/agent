@@ -11,7 +11,7 @@ from agent_runtime.providers import ModelResponse, ModelStreamEvent, ToolCall
 from agent_runtime.skills import SkillManifest
 from agent_runtime.tools import ToolRegistry, ToolSpec
 from web.server import create_app
-from web.session import WebSession
+from web.session import WebProjectStore, WebSession
 
 
 class FakeProvider:
@@ -147,6 +147,7 @@ def make_session(tmp_path, provider=None, tool_registry=None):
         memory_store=MemoryStore(tmp_path / "memory.sqlite3"),
         long_term_memory=LongTermMemory(),
         tool_registry=tool_registry,
+        project_store=WebProjectStore(tmp_path / "web_projects.sqlite3"),
     )
 
 
@@ -159,7 +160,7 @@ def test_web_session_bootstrap_status(tmp_path):
     assert events[0].payload["model"] == "fake-model"
     assert events[0].payload["context"].startswith("输入上下文：")
     assert events[0].payload["context"].endswith(" / 123.0k")
-    assert events[0].payload["contextUsed"] > 0
+    assert events[0].payload["contextUsed"] == 0
     assert events[0].payload["inputBudgetTokens"] == 123000
     assert events[0].payload["contextWindow"] == 128000
     assert events[0].payload["logFile"]
@@ -216,7 +217,7 @@ def test_web_session_can_disable_reasoning(tmp_path):
     assert provider.configs[0].extra_body == {"enable_thinking": False}
 
 
-def test_web_session_bootstrap_reuses_previous_usage(tmp_path):
+def test_web_session_bootstrap_does_not_guess_previous_usage(tmp_path):
     session = make_session(tmp_path)
 
     list(session.submit("conversation-1", "hi"))
@@ -225,7 +226,7 @@ def test_web_session_bootstrap_reuses_previous_usage(tmp_path):
     assert events[0].type == "status"
     assert events[0].payload["context"].startswith("输入上下文：")
     assert events[0].payload["context"].endswith(" / 123.0k")
-    assert events[0].payload["contextUsed"] > 0
+    assert events[0].payload["contextUsed"] == 0
 
 
 def test_conversation_payload_uses_per_conversation_context_window(tmp_path):
@@ -298,9 +299,112 @@ def test_fastapi_bootstrap_and_commands(tmp_path):
     }
 
 
+def test_web_session_select_project_only_switches_project(tmp_path):
+    session = make_session(tmp_path)
+    project = session.list_projects()[0]
+
+    selected = session.select_project(project["id"])
+
+    assert selected["project"]["id"] == project["id"]
+    assert selected["conversations"] == []
+    assert session.list_conversations(project["id"]) == []
+
+
+def test_web_session_project_conversations_are_scoped(tmp_path):
+    session = make_session(tmp_path)
+    first = session.list_projects()[0]
+    second = session.project_store.ensure_project(tmp_path / "other")
+
+    first_conversation = session.create_conversation(project_id=first["id"])
+    second_conversation = session.create_conversation(project_id=second.id)
+
+    projects = {item["id"]: item for item in session.list_projects()}
+    assert projects[first["id"]]["conversationCount"] == 1
+    assert projects[second.id]["conversationCount"] == 1
+    assert [item["id"] for item in session.list_conversations(first["id"])] == [
+        first_conversation["id"]
+    ]
+    assert [item["id"] for item in session.list_conversations(second.id)] == [
+        second_conversation["id"]
+    ]
+
+
+def test_web_session_add_project_registers_directory(tmp_path):
+    session = make_session(tmp_path)
+    project_dir = tmp_path / "added"
+    project_dir.mkdir()
+
+    project = session.add_project(project_dir)
+
+    assert project["name"] == "added"
+    assert project["path"] == str(project_dir.resolve())
+    assert project["conversationCount"] == 0
+    assert session.select_project(project["id"])["conversations"] == []
+
+
+def test_web_session_delete_project_removes_project_without_deleting_conversation(tmp_path):
+    session = make_session(tmp_path)
+    project_dir = tmp_path / "removed"
+    project_dir.mkdir()
+    project = session.add_project(project_dir)
+    conversation = session.create_conversation(project_id=project["id"])
+
+    session.delete_project(project["id"])
+
+    assert project["id"] not in {item["id"] for item in session.list_projects()}
+    assert session.list_conversations(project["id"]) == []
+    assert conversation["id"] in {item["id"] for item in session.list_conversations()}
+
+
+def test_fastapi_projects_select_endpoint_switches_project(tmp_path):
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+    project_id = client.get("/api/projects").json()["items"][0]["id"]
+
+    response = client.post("/api/projects/select", json={"project_id": project_id})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["project"]["id"] == project_id
+    assert payload["conversations"] == []
+
+
+def test_fastapi_projects_create_endpoint_adds_project(tmp_path):
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+    project_dir = tmp_path / "web-added"
+    project_dir.mkdir()
+
+    response = client.post("/api/projects", json={"path": str(project_dir)})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["name"] == "web-added"
+    assert payload["path"] == str(project_dir.resolve())
+
+
+def test_fastapi_projects_delete_endpoint_removes_project(tmp_path):
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+    project_dir = tmp_path / "api-removed"
+    project_dir.mkdir()
+    project = client.post("/api/projects", json={"path": str(project_dir)}).json()
+
+    response = client.delete(f"/api/projects/{project['id']}")
+
+    assert response.status_code == 200
+    project_ids = {item["id"] for item in client.get("/api/projects").json()["items"]}
+    assert project["id"] not in project_ids
+    assert client.delete("/api/projects/missing").status_code == 404
+
+
 def test_fastapi_runtime_logs_endpoint_returns_log_content(tmp_path, monkeypatch):
     log_path = tmp_path / "runtime.jsonl"
-    log_path.write_text('{"event":"test","payload":{"ok":true}}\n', encoding="utf-8")
+    log_path.write_text(
+        '{"ts":"2026-06-26T16:30:52+0800","event":"agent_round_start",'
+        '"payload":{"conversation_id":"conversation-1","round_index":1}}\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("AGENT_RUNTIME_LOG_FILE", str(log_path))
     session = make_session(tmp_path)
     client = TestClient(create_app(session=session))
@@ -311,8 +415,28 @@ def test_fastapi_runtime_logs_endpoint_returns_log_content(tmp_path, monkeypatch
     payload = response.json()
     assert payload["path"] == str(log_path)
     assert payload["exists"] is True
-    assert '{"event":"test","payload":{"ok":true}}\n' in payload["content"]
+    assert "[conversa] 第 1 轮：准备上下文" in payload["content"]
     assert payload["error"] == ""
+
+
+def test_fastapi_runtime_logs_clear_endpoint_truncates_log(tmp_path, monkeypatch):
+    log_path = tmp_path / "runtime.jsonl"
+    log_path.write_text('{"event":"test","payload":{"ok":true}}\n', encoding="utf-8")
+    monkeypatch.setenv("AGENT_RUNTIME_LOG_FILE", str(log_path))
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+
+    response = client.delete("/api/logs/runtime")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "path": str(log_path),
+        "content": "",
+        "exists": True,
+        "error": "",
+    }
+    assert log_path.read_text(encoding="utf-8") == ""
 
 
 def test_fastapi_cancel_marks_request_cancelled(tmp_path):
@@ -639,7 +763,7 @@ def test_web_session_groups_one_user_turn_into_one_assistant_message(tmp_path):
         "assistant",
     ]
     assistant = conversation["messages"][1]
-    assert assistant["text"] == "I can check.\n\nThe skill is not registered."
+    assert assistant["text"] == "The skill is not registered."
     assert assistant["tools"][0]["name"] == "skill_read"
     assert assistant["steps"] == [
         {
@@ -672,3 +796,30 @@ def test_fastapi_conversation_crud_and_chat(tmp_path):
     assert listed["items"][0]["messages"][0]["text"] == "hi"
     assert deleted.status_code == 200
     assert client.get("/api/conversations").json()["items"] == []
+
+
+def test_fastapi_project_picker_adds_selected_directory(tmp_path, monkeypatch):
+    selected = tmp_path / "selected-project"
+    selected.mkdir()
+    monkeypatch.setattr("web.server._pick_directory", lambda: str(selected))
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+
+    response = client.post("/api/projects/pick")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cancelled"] is False
+    assert payload["project"]["path"] == str(selected)
+    assert payload["project"]["name"] == "selected-project"
+
+
+def test_fastapi_project_picker_allows_cancel(tmp_path, monkeypatch):
+    monkeypatch.setattr("web.server._pick_directory", lambda: "")
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+
+    response = client.post("/api/projects/pick")
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": True}

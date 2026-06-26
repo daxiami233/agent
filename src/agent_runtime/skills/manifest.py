@@ -19,3 +19,4 @@ class SkillManifest:
     context_files: list[str] = field(default_factory=list)
     required_tools: list[str] = field(default_factory=list)
     skill_dir: Path | str | None = None
+    source: str = "user"

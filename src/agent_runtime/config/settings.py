@@ -14,7 +14,7 @@ from agent_runtime.context import (
     DEFAULT_SAFETY_MARGIN_TOKENS,
 )
 from agent_runtime.memory.long_term import MAX_LINES as DEFAULT_LONG_TERM_MEMORY_LINES
-from agent_runtime.tools.skills import DEFAULT_MAX_RESOURCE_BYTES
+from agent_runtime.tools.builtin.skills_tool import DEFAULT_MAX_RESOURCE_BYTES
 
 
 DEFAULT_DATA_DIR = Path.home() / ".agent-runtime"

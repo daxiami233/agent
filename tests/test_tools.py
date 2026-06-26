@@ -13,6 +13,7 @@ from agent_runtime.tools import (
     ToolRegistry,
     ToolSpec,
     built_in_tool_registry,
+    list_skills_tool,
     memory_tools,
     shell_command_tool,
     skill_tools,
@@ -151,6 +152,28 @@ def test_memory_append_requires_content():
 
     with pytest.raises(ValueError, match="content"):
         registry.execute("memory_append", {"content": "   "})
+
+
+def test_list_skills_tool_returns_name_and_description_only():
+    registry = ToolRegistry(
+        [
+            list_skills_tool(
+                SkillRegistry(
+                    [
+                        SkillManifest(
+                            name="example",
+                            description="Example skill.",
+                            source="system",
+                        )
+                    ]
+                )
+            )
+        ]
+    )
+
+    assert registry.execute("list_skills", {}) == [
+        {"name": "example", "description": "Example skill."}
+    ]
 
 
 def test_skill_tools_read_skill_and_resource(tmp_path):

@@ -55,8 +55,12 @@ class RepeatingToolProvider:
 
     def __init__(self):
         self.calls = 0
+        self.inputs = []
+        self.tools = []
 
     def stream(self, input, **kwargs):
+        self.inputs.append(input)
+        self.tools.append(kwargs.get("tools") or [])
         self.calls += 1
         yield ModelStreamEvent(
             type="finish",
@@ -161,7 +165,7 @@ def test_agent_loop_run_user_turn_writes_user_message(tmp_path):
     }
 
 
-def test_agent_loop_stops_on_third_identical_tool_call(tmp_path):
+def test_agent_loop_blocks_repeated_tool_call(tmp_path):
     store = MemoryStore(tmp_path / "memory.sqlite3")
     context = ContextEngine(store)
     context.add_user_message("conversation-1", "weather")
@@ -180,16 +184,24 @@ def test_agent_loop_stops_on_third_identical_tool_call(tmp_path):
 
     events = list(loop.run("conversation-1"))
 
-    assert [event.type for event in events] == [
-        "tool_call_start",
-        "tool_call_result",
-        "tool_call_start",
-        "tool_call_result",
-        "notice",
-    ]
+    event_types = [event.type for event in events]
+    assert event_types.count("tool_call_start") == 2
+    assert event_types.count("tool_call_result") == 2
+    assert events[-1].type == "notice"
     assert events[-1].payload == {
         "tone": "error",
         "text": "检测到重复工具调用，已停止继续调用。",
     }
-    assert provider.calls == 3
-    assert store.message_count("conversation-1") == 5
+    assert provider.calls >= 3
+    assert any(
+        any(
+            message.get("role") == "system"
+            and "Duplicate call detected for weather" in str(message.get("content", ""))
+            for message in model_input
+        )
+        for model_input in provider.inputs
+    )
+    assert any(
+        "weather" not in {tool["function"]["name"] for tool in tools}
+        for tools in provider.tools
+    )

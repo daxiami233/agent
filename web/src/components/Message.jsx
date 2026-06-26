@@ -1,5 +1,7 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 
 function formatValue(value) {
   if (value === undefined) return "";
@@ -50,10 +52,21 @@ function JsonView({ value }) {
   return <pre className="jsonView">{nodes}</pre>;
 }
 
+function normalizeMath(text) {
+  return text
+    .replace(/\\\[(.+?)\\\]/gs, "$$$$$1$$$$")
+    .replace(/\\\((.+?)\\\)/g, "$$$1$$");
+}
+
 function MarkdownContent({ className = "", text }) {
   return (
     <div className={`markdownBody ${className}`.trim()}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+      >
+        {normalizeMath(text)}
+      </ReactMarkdown>
     </div>
   );
 }
@@ -186,6 +199,11 @@ export default function Message({ message }) {
           ) : (
             <div>{message.text}</div>
           ))}
+        {message.noticeText && (
+          <div className="assistantNoticeSeparator">
+            <MarkdownContent className="noticeMarkdown" text={message.noticeText} />
+          </div>
+        )}
       </div>
     </article>
   );

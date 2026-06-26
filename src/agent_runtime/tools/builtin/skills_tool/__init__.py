@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_runtime.skills import SkillManifest, SkillRegistry
 
-from .registry import ToolSpec
+from agent_runtime.tools.registry import ToolSpec
 
 
 DEFAULT_MAX_RESOURCE_BYTES = 64_000

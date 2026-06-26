@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { uid } from "./utils";
 import {
+  clearRuntimeLog as clearRemoteRuntimeLog,
   fetchBootstrap,
   fetchCommands,
-  fetchConversations,
+  fetchProjects,
   fetchRuntimeLog,
   createConversation as createRemoteConversation,
   deleteConversation as deleteRemoteConversation,
+  deleteProject as deleteRemoteProject,
+  pickProject as pickRemoteProject,
+  selectProject as selectRemoteProject,
   sendChat,
   cancelGeneration,
   applyEvent,
@@ -17,6 +21,7 @@ import CommandMenu from "./components/CommandMenu";
 
 const LEGACY_STORAGE_KEY = "agent-runtime-web-state-v1";
 const ACTIVE_CONVERSATION_KEY = "agent-runtime-active-conversation-v1";
+const ACTIVE_PROJECT_KEY = "agent-runtime-active-project-v1";
 const REASONING_ENABLED_KEY = "agent-runtime-reasoning-enabled-v1";
 const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
 
@@ -24,44 +29,48 @@ function isNearBottom(element) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
 }
 
-function createLocalConversation(title = "新对话") {
-  return {
-    id: uid(),
-    title,
-    messages: [],
-    createdAt: Date.now(),
-    context: "输入上下文：未配置",
-    contextUsed: 0,
-    inputBudgetTokens: null,
-    contextWindow: null,
-  };
-}
-
 function normalizeConversation(conversation) {
   return {
     id: conversation.id || uid(),
     title: conversation.title || "新对话",
     messages: Array.isArray(conversation.messages)
-      ? conversation.messages.map((message) => ({
-          id: message.id || uid(),
-          role: message.role,
-          text: message.text ?? message.content ?? "",
-          reasoning: message.reasoning,
-          reasoningOpen: Boolean(message.reasoningOpen),
-          reasoningComplete: Boolean(message.reasoningComplete),
-          streamComplete: Boolean(message.streamComplete),
-          completedKey: message.completedKey ?? "",
-          steps: Array.isArray(message.steps) ? message.steps : [],
-          tools: Array.isArray(message.tools) ? message.tools : [],
-          tone: message.tone,
-        }))
+      ? conversation.messages.map(normalizeMessage)
       : [],
     createdAt: conversation.createdAt || Date.now(),
     updatedAt: conversation.updatedAt || conversation.createdAt || Date.now(),
-    context: conversation.context ?? "输入上下文：未配置",
+    context: conversation.context ?? "",
     contextUsed: conversation.contextUsed ?? 0,
     inputBudgetTokens: conversation.inputBudgetTokens ?? null,
     contextWindow: conversation.contextWindow ?? null,
+  };
+}
+
+function normalizeProject(project) {
+  return {
+    id: project.id || uid(),
+    name: project.name || "未命名项目",
+    path: project.path || "",
+    createdAt: project.createdAt || Date.now(),
+    updatedAt: project.updatedAt || project.createdAt || Date.now(),
+    lastOpenedAt: project.lastOpenedAt || 0,
+    conversationCount: project.conversationCount ?? 0,
+  };
+}
+
+function normalizeMessage(message) {
+  return {
+    id: message.id || uid(),
+    role: message.role,
+    text: message.text ?? message.content ?? "",
+    noticeText: message.noticeText ?? "",
+    reasoning: message.reasoning,
+    reasoningOpen: Boolean(message.reasoningOpen),
+    reasoningComplete: Boolean(message.reasoningComplete),
+    streamComplete: Boolean(message.streamComplete),
+    completedKey: message.completedKey ?? "",
+    steps: Array.isArray(message.steps) ? message.steps : [],
+    tools: Array.isArray(message.tools) ? message.tools : [],
+    tone: message.tone,
   };
 }
 
@@ -140,7 +149,7 @@ function CommandPanel({ panel, onClose }) {
   );
 }
 
-function RuntimeLogModal({ log, loading, error, onRefresh, onClose }) {
+function RuntimeLogModal({ log, loading, error, onRefresh, onClear, onClose }) {
   useEffect(() => {
     function handleKeyDown(event) {
       if (event.key === "Escape") {
@@ -166,6 +175,14 @@ function RuntimeLogModal({ log, loading, error, onRefresh, onClose }) {
             <p title={log.path}>{log.path || "未找到日志路径"}</p>
           </div>
           <div className="runtimeLogActions">
+            <button
+              type="button"
+              className="danger"
+              onClick={onClear}
+              disabled={loading}
+            >
+              清空
+            </button>
             <button type="button" onClick={onRefresh} disabled={loading}>
               {loading ? "刷新中" : "刷新"}
             </button>
@@ -196,11 +213,63 @@ function TypingIndicator() {
   );
 }
 
+function ProjectChooser({
+  projects,
+  error,
+  onOpenProject,
+  onSelect,
+}) {
+  return (
+    <div className="projectChooser">
+      <div className="projectChooserInner">
+        <h1>选择项目</h1>
+        <button type="button" className="projectOpenButton" onClick={onOpenProject}>
+          打开项目
+        </button>
+        <div className="projectGrid">
+          {projects.map((project) => (
+            <button
+              type="button"
+              className="projectCard"
+              key={project.id}
+              onClick={() => onSelect(project.id)}
+            >
+              <span className="projectIcon" aria-hidden="true">□</span>
+              <span className="projectName">{project.name}</span>
+              <span className="projectPath">{project.path}</span>
+            </button>
+          ))}
+        </div>
+        {projects.length === 0 && <p>没有可用项目。</p>}
+        {error && <div className="error">{error}</div>}
+      </div>
+    </div>
+  );
+}
+
+function ProjectEmpty({ project, error, onCreateConversation }) {
+  return (
+    <div className="projectEmpty">
+      <div className="projectEmptyInner">
+        <div className="projectEmptyLabel">当前项目</div>
+        <h1>{project.name}</h1>
+        <p>{project.path}</p>
+        <button type="button" onClick={onCreateConversation}>
+          新对话
+        </button>
+        {error && <div className="error">{error}</div>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [conversationState, setConversationState] = useState(() => {
-    const first = createLocalConversation();
-    return { items: [first], activeId: first.id };
+    return { items: [], activeId: "" };
   });
+  const [projects, setProjects] = useState([]);
+  const [activeProjectId, setActiveProjectId] = useState("");
+  const [expandedProjectIds, setExpandedProjectIds] = useState([]);
   const [input, setInput] = useState("");
   const [promptHistory, setPromptHistory] = useState([]);
   const [historyIndex, setHistoryIndex] = useState(null);
@@ -208,7 +277,7 @@ export default function App() {
     cwd: "agent",
     cwdPath: "",
     model: "未配置",
-    context: "输入上下文：未配置",
+    context: "",
     contextUsed: 0,
     inputBudgetTokens: null,
     contextWindow: null,
@@ -222,14 +291,14 @@ export default function App() {
       return true;
     }
   });
-  const [streaming, setStreaming] = useState(false);
-  const [streamingConversationId, setStreamingConversationId] = useState("");
+  const [activeRequests, setActiveRequests] = useState({});
   const [error, setError] = useState("");
   const [commandPanel, setCommandPanel] = useState(null);
   const [activeCommandIndex, setActiveCommandIndex] = useState(0);
   const [commandMenuDismissed, setCommandMenuDismissed] = useState(false);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState(null);
+  const [projectDeleteTarget, setProjectDeleteTarget] = useState(null);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const [logModalOpen, setLogModalOpen] = useState(false);
   const [runtimeLog, setRuntimeLog] = useState({
@@ -241,14 +310,16 @@ export default function App() {
   const [runtimeLogError, setRuntimeLogError] = useState("");
   const transcriptRef = useRef(null);
   const textareaRef = useRef(null);
-  const controllerRef = useRef(null);
-  const requestIdRef = useRef("");
+  const controllersRef = useRef(new Map());
   const autoFollowRef = useRef(true);
 
   const conversations = conversationState.items;
+  const activeProject =
+    projects.find((project) => project.id === activeProjectId) ?? null;
   const activeConversation =
-    conversations.find((conversation) => conversation.id === conversationState.activeId) ?? conversations[0];
+    conversations.find((conversation) => conversation.id === conversationState.activeId) ?? null;
   const activeMessages = activeConversation?.messages ?? [];
+  const activeRequest = activeConversation ? activeRequests[activeConversation.id] : null;
 
   useEffect(() => {
     try {
@@ -262,10 +333,11 @@ export default function App() {
     if (!conversationsLoaded) return;
     try {
       localStorage.setItem(ACTIVE_CONVERSATION_KEY, conversationState.activeId);
+      localStorage.setItem(ACTIVE_PROJECT_KEY, activeProjectId);
     } catch {
       // localStorage may be unavailable in restricted browser contexts.
     }
-  }, [conversationState.activeId, conversationsLoaded]);
+  }, [activeProjectId, conversationState.activeId, conversationsLoaded]);
 
   useEffect(() => {
     try {
@@ -318,41 +390,45 @@ export default function App() {
 
   function applyConversationStatus(conversation) {
     if (!conversation) return;
-    setStatus((current) => ({
-      ...current,
-      context: conversation.context ?? current.context,
-      contextUsed: conversation.contextUsed ?? current.contextUsed,
-      inputBudgetTokens: conversation.inputBudgetTokens ?? current.inputBudgetTokens,
-      contextWindow: conversation.contextWindow ?? current.contextWindow,
-    }));
+    setStatus((current) => {
+      const nextContext = conversation.context ?? current.context;
+      const nextUsed = conversation.contextUsed ?? current.contextUsed;
+      const nextBudget = conversation.inputBudgetTokens ?? current.inputBudgetTokens;
+      const nextWindow = conversation.contextWindow ?? current.contextWindow;
+      if (
+        nextContext === current.context &&
+        nextUsed === current.contextUsed &&
+        nextBudget === current.inputBudgetTokens &&
+        nextWindow === current.contextWindow
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        context: nextContext,
+        contextUsed: nextUsed,
+        inputBudgetTokens: nextBudget,
+        contextWindow: nextWindow,
+      };
+    });
   }
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([fetchBootstrap(), fetchCommands(), fetchConversations()])
-      .then(async ([boot, commandData, conversationData]) => {
-        let items = (conversationData.items ?? []).map(normalizeConversation);
-        if (items.length === 0) {
-          items = [normalizeConversation(await createRemoteConversation())];
-        }
-        let savedActiveId = "";
-        try {
-          savedActiveId = localStorage.getItem(ACTIVE_CONVERSATION_KEY) ?? "";
-        } catch {
-          savedActiveId = "";
-        }
-        const activeId = items.some((conversation) => conversation.id === savedActiveId)
-          ? savedActiveId
-          : items[0].id;
+    Promise.all([fetchBootstrap(), fetchCommands(), fetchProjects()])
+      .then(([boot, commandData, projectData]) => {
+        const projectItems = (projectData.items ?? []).map(normalizeProject);
         if (!mounted) return;
         setCommands(commandData.commands ?? []);
-        setPromptHistory(promptsFromConversations(items));
-        setConversationState({ items, activeId });
+        setProjects(projectItems);
+        setPromptHistory([]);
+        setConversationState({ items: [], activeId: "" });
+        setActiveProjectId("");
         setConversationsLoaded(true);
         for (const event of boot.events ?? []) {
-          applyEvent(event, (updater) => updateConversationMessages(activeId, updater), setStatus);
+          if (event.type === "status") setStatus((current) => ({ ...current, ...event }));
+          if (event.type === "notice") setError(event.text ?? "");
         }
-        applyConversationStatus(items.find((conversation) => conversation.id === activeId) ?? items[0]);
       })
       .catch((err) => setError(String(err)));
     return () => {
@@ -389,7 +465,7 @@ export default function App() {
   useEffect(() => {
     if (!autoFollowRef.current) return;
     requestAnimationFrame(() => scrollTranscriptToBottom());
-  }, [activeMessages, streaming]);
+  }, [activeMessages, activeRequest]);
 
   useEffect(() => {
     if (!conversationsLoaded) return;
@@ -434,23 +510,25 @@ export default function App() {
   }
 
   async function submit() {
+    if (!activeConversation) return;
     await submitText(input.trim(), activeConversation.id);
   }
 
   async function submitText(value, conversationId) {
-    if (!value || streaming) return;
+    if (!value || activeRequests[conversationId]) return;
     autoFollowRef.current = true;
     setShowJumpToBottom(false);
     requestAnimationFrame(() => scrollTranscriptToBottom());
     const requestId = uid();
     const controller = new AbortController();
-    requestIdRef.current = requestId;
-    controllerRef.current = controller;
-    setStreamingConversationId(conversationId);
+    controllersRef.current.set(conversationId, controller);
     setInput("");
     setError("");
     setCommandMenuDismissed(false);
-    setStreaming(true);
+    setActiveRequests((current) => ({
+      ...current,
+      [conversationId]: { requestId },
+    }));
     const isCommand = value.startsWith("/") || value.startsWith(":");
     if (isCommand) {
       setCommandPanel({
@@ -475,19 +553,32 @@ export default function App() {
         }
       });
     } catch (err) {
-      if (err.name !== "AbortError") setError(String(err));
+      if (err.name !== "AbortError") {
+        if (isCommand) {
+          setCommandPanel((current) => {
+            if (!current) return current;
+            return { ...current, tone: "error", lines: [...current.lines, String(err)] };
+          });
+        } else {
+          setError(String(err));
+        }
+      }
     } finally {
-      controllerRef.current = null;
-      requestIdRef.current = "";
-      setStreaming(false);
-      setStreamingConversationId("");
+      controllersRef.current.delete(conversationId);
+      setActiveRequests((current) => {
+        if (current[conversationId]?.requestId !== requestId) return current;
+        const next = { ...current };
+        delete next[conversationId];
+        return next;
+      });
     }
   }
 
   async function stopGeneration() {
-    const requestId = requestIdRef.current;
-    const conversationId = streamingConversationId || activeConversation.id;
-    if (!streaming || !requestId) return;
+    if (!activeConversation) return;
+    const conversationId = activeConversation.id;
+    const requestId = activeRequests[conversationId]?.requestId;
+    if (!requestId) return;
     applyEvent(
       { type: "assistant_notice", text: "生成已停止" },
       (updater) => updateConversationMessages(conversationId, updater),
@@ -498,7 +589,7 @@ export default function App() {
     } catch {
       // 即使取消请求失败，本地中断也会立即释放界面。
     } finally {
-      controllerRef.current?.abort();
+      controllersRef.current.get(conversationId)?.abort();
     }
   }
 
@@ -549,19 +640,103 @@ export default function App() {
   }
 
   function executeCommand(name) {
+    if (!activeConversation) return;
     submitText(name, activeConversation.id);
   }
 
-  async function createNewConversation() {
+  function updateProjectConversationCount(projectId, updater) {
+    setProjects((current) =>
+      current.map((project) => {
+        if (project.id !== projectId) return project;
+        const nextCount = Math.max(0, updater(project.conversationCount ?? 0));
+        return { ...project, conversationCount: nextCount };
+      }),
+    );
+  }
+
+  function toggleProject(projectId) {
+    if (projectId !== activeProjectId) {
+      selectProject(projectId);
+      return;
+    }
+    setExpandedProjectIds((current) =>
+      current.includes(projectId)
+        ? current.filter((id) => id !== projectId)
+        : [...current, projectId],
+    );
+  }
+
+  async function selectProject(projectId) {
+    setError("");
     try {
-      const conversation = normalizeConversation(await createRemoteConversation());
+      const payload = await selectRemoteProject(projectId);
+      const selectedProject = normalizeProject(payload.project ?? {});
+      const items = (payload.conversations ?? []).map(normalizeConversation);
+      const selectedWithCount = {
+        ...selectedProject,
+        conversationCount:
+          typeof payload.project?.conversationCount === "number"
+            ? payload.project.conversationCount
+            : items.length,
+      };
+      setProjects((current) =>
+        current.some((project) => project.id === selectedWithCount.id)
+          ? current.map((project) =>
+              project.id === selectedWithCount.id ? selectedWithCount : project,
+            )
+          : [selectedWithCount, ...current],
+      );
+      setActiveProjectId(selectedWithCount.id);
+      setExpandedProjectIds((current) =>
+        current.includes(selectedWithCount.id) ? current : [...current, selectedWithCount.id],
+      );
+      setConversationState({ items, activeId: items[0]?.id ?? "" });
+      setPromptHistory(promptsFromConversations(items));
+      setInput("");
+      setCommandMenuDismissed(false);
+      applyConversationStatus(items[0] ?? null);
+      if (items.length > 0) {
+        requestAnimationFrame(() => document.querySelector(".composer textarea")?.focus());
+      }
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function openProject() {
+    setError("");
+    try {
+      const payload = await pickRemoteProject();
+      if (payload.cancelled) return;
+      const project = normalizeProject(payload.project ?? {});
+      setProjects((current) => [
+        project,
+        ...current.filter((item) => item.id !== project.id),
+      ]);
+      await selectProject(project.id);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function createNewConversation() {
+    if (!activeProject) return;
+    try {
+      const conversation = normalizeConversation(
+        await createRemoteConversation("新对话", activeProject.id),
+      );
       setConversationState((current) => ({
         items: [conversation, ...current.items],
         activeId: conversation.id,
       }));
+      setExpandedProjectIds((current) =>
+        current.includes(activeProject.id) ? current : [...current, activeProject.id],
+      );
+      updateProjectConversationCount(activeProject.id, (count) => count + 1);
       setInput("");
       setError("");
       setCommandMenuDismissed(false);
+      applyConversationStatus(conversation);
       requestAnimationFrame(() => document.querySelector(".composer textarea")?.focus());
     } catch (err) {
       setError(String(err));
@@ -576,24 +751,37 @@ export default function App() {
       return;
     }
     setDeleteTarget(null);
-    let replacement = null;
-    if (conversations.length === 1) {
-      try {
-        replacement = normalizeConversation(await createRemoteConversation());
-      } catch (err) {
-        setError(String(err));
-        replacement = createLocalConversation();
-      }
-    }
     setConversationState((current) => {
       const remaining = current.items.filter((conversation) => conversation.id !== conversationId);
       if (remaining.length === 0) {
-        const next = replacement ?? createLocalConversation();
-        return { items: [next], activeId: next.id };
+        return { items: [], activeId: "" };
       }
       const activeId = current.activeId === conversationId ? remaining[0].id : current.activeId;
       return { items: remaining, activeId };
     });
+    if (activeProject) {
+      updateProjectConversationCount(activeProject.id, (count) => count - 1);
+    }
+  }
+
+  async function deleteProject(projectId) {
+    try {
+      await deleteRemoteProject(projectId);
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    setProjectDeleteTarget(null);
+    setProjects((current) => current.filter((project) => project.id !== projectId));
+    setExpandedProjectIds((current) => current.filter((id) => id !== projectId));
+    if (projectId === activeProjectId) {
+      setActiveProjectId("");
+      setConversationState({ items: [], activeId: "" });
+      setPromptHistory([]);
+      setInput("");
+      setCommandMenuDismissed(false);
+    }
+    setError("");
   }
 
   async function openRuntimeLog() {
@@ -619,61 +807,129 @@ export default function App() {
     }
   }
 
+  async function clearRuntimeLog() {
+    setRuntimeLogLoading(true);
+    setRuntimeLogError("");
+    try {
+      const payload = await clearRemoteRuntimeLog();
+      setRuntimeLog({
+        path: payload.path || "",
+        content: "",
+        exists: Boolean(payload.exists),
+      });
+      if (payload.error) setRuntimeLogError(payload.error);
+    } catch (err) {
+      setRuntimeLogError(String(err));
+    } finally {
+      setRuntimeLogLoading(false);
+    }
+  }
+
   return (
     <main className="shell">
       <aside className="sidebar">
         <div className="sideHeader">
           <div>
             <div className="brand">智能体运行时</div>
-            <div className="subtitle">本地网页智能体</div>
           </div>
-          <button type="button" onClick={createNewConversation}>新对话</button>
+          <div className="sideActions">
+            <button type="button" onClick={openProject}>
+              打开项目
+            </button>
+            <button type="button" onClick={createNewConversation} disabled={!activeProject}>
+              新对话
+            </button>
+          </div>
         </div>
-        <nav className="conversationList" aria-label="对话列表">
-          {conversations.map((conversation) => (
-            <div
-              key={conversation.id}
-              className={`conversationItem ${conversation.id === activeConversation.id ? "active" : ""}`}
-            >
-              <button
-                type="button"
-                className="conversationOpen"
-                onClick={() => setConversationState((current) => ({ ...current, activeId: conversation.id }))}
-              >
-                <span>{conversation.title}</span>
-              </button>
-              <button
-                type="button"
-                className="conversationDelete"
-                aria-label={`删除 ${conversation.title}`}
-                onClick={() => setDeleteTarget(conversation)}
-              >
-                ×
-              </button>
+        <nav className="conversationList" aria-label="项目和对话列表">
+          <div className="sidebarSectionTitle">项目</div>
+          {projects.map((project) => (
+            <div className="projectTreeNode" key={project.id}>
+              <div className="projectListRow">
+                <button
+                  type="button"
+                  className={`projectListItem ${project.id === activeProjectId ? "active" : ""}`}
+                  onClick={() => toggleProject(project.id)}
+                  aria-expanded={expandedProjectIds.includes(project.id)}
+                >
+                  <span>{project.name}</span>
+                  <span className="projectCount">{project.conversationCount ?? 0}</span>
+                </button>
+                <button
+                  type="button"
+                  className="projectDelete"
+                  aria-label={`移除项目 ${project.name}`}
+                  onClick={() => setProjectDeleteTarget(project)}
+                >
+                  ×
+                </button>
+              </div>
+              {project.id === activeProjectId && expandedProjectIds.includes(project.id) && (
+                <div className="projectBranch">
+                  <div className="projectBranchTitle">对话</div>
+                  {conversations.map((conversation) => (
+                    <div
+                      key={conversation.id}
+                      className={`conversationItem ${conversation.id === activeConversation?.id ? "active" : ""} ${activeRequests[conversation.id] ? "running" : ""}`}
+                    >
+                      <button
+                        type="button"
+                        className="conversationOpen"
+                        onClick={() => setConversationState((current) => ({ ...current, activeId: conversation.id }))}
+                      >
+                        <span>{conversation.title}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="conversationDelete"
+                        aria-label={`删除 ${conversation.title}`}
+                        onClick={() => setDeleteTarget(conversation)}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
         </nav>
       </aside>
 
       <section className="chatPane">
-        <section
-          ref={transcriptRef}
-          className="transcript"
-          onScroll={updateScrollFollowState}
-        >
-          {activeMessages.length === 0 ? (
-            <div className="welcome">
-              <h1>有什么可以帮你？</h1>
-              <p>输入问题，或使用斜杠命令查看当前运行状态。</p>
-            </div>
-          ) : (
-            activeMessages.map((message) => <Message key={message.id} message={message} />)
-          )}
-          {streaming && streamingConversationId === activeConversation.id && (
-            <TypingIndicator />
-          )}
-        </section>
-        {showJumpToBottom && (
+        {!activeProject ? (
+          <ProjectChooser
+            projects={projects}
+            error={error}
+            onOpenProject={openProject}
+            onSelect={selectProject}
+          />
+        ) : !activeConversation ? (
+          <ProjectEmpty
+            project={activeProject}
+            error={error}
+            onCreateConversation={createNewConversation}
+          />
+        ) : (
+          <section
+            ref={transcriptRef}
+            className="transcript"
+            onScroll={updateScrollFollowState}
+          >
+            {activeMessages.length === 0 ? (
+              <div className="welcome">
+                <h1>有什么可以帮你？</h1>
+                <p>输入问题，或使用斜杠命令查看当前运行状态。</p>
+              </div>
+            ) : (
+              activeMessages.map((message) => <Message key={message.id} message={message} />)
+            )}
+            {activeRequest && (
+              <TypingIndicator />
+            )}
+          </section>
+        )}
+        {activeProject && activeConversation && showJumpToBottom && (
           <button
             type="button"
             className="jumpToBottom"
@@ -685,6 +941,7 @@ export default function App() {
           </button>
         )}
 
+        {activeProject && activeConversation && (
         <section className="composerWrap">
           <div className="composerStack">
             <div className="commandOverlay">
@@ -698,7 +955,7 @@ export default function App() {
             {commandPanel && (
               <CommandPanel panel={commandPanel} onClose={() => setCommandPanel(null)} />
             )}
-            {error && <div className="error">{error}</div>}
+            {!commandPanel && error && <div className="error">{error}</div>}
             <div className="composer">
               <textarea
                 ref={textareaRef}
@@ -722,16 +979,17 @@ export default function App() {
               </button>
               <button
                 type="button"
-                className={streaming ? "stop" : ""}
-                onClick={streaming ? stopGeneration : submit}
-                disabled={!streaming && !input.trim()}
+                className={activeRequest ? "stop" : ""}
+                onClick={activeRequest ? stopGeneration : submit}
+                disabled={!activeRequest && !input.trim()}
               >
-                {streaming ? "停止" : "发送"}
+                {activeRequest ? "停止" : "发送"}
               </button>
             </div>
             <RuntimeStatus status={status} />
           </div>
         </section>
+        )}
       </section>
       <button
         type="button"
@@ -748,6 +1006,7 @@ export default function App() {
           loading={runtimeLogLoading}
           error={runtimeLogError}
           onRefresh={refreshRuntimeLog}
+          onClear={clearRuntimeLog}
           onClose={() => setLogModalOpen(false)}
         />
       )}
@@ -771,6 +1030,35 @@ export default function App() {
                 onClick={() => deleteConversation(deleteTarget.id)}
               >
                 删除
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {projectDeleteTarget && (
+        <div className="modalBackdrop" role="presentation">
+          <section
+            className="confirmDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="project-delete-dialog-title"
+          >
+            <h2 id="project-delete-dialog-title">移除项目？</h2>
+            <p>
+              {projectDeleteTarget.name}
+              <br />
+              只从项目列表移除，不会删除本机文件。
+            </p>
+            <div className="confirmActions">
+              <button type="button" onClick={() => setProjectDeleteTarget(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => deleteProject(projectDeleteTarget.id)}
+              >
+                移除
               </button>
             </div>
           </section>

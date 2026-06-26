@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,14 +59,18 @@ from agent_runtime.memory.store import MemoryStore, MemoryStoreProtocol, StoredM
 
 
 CONTEXT_MESSAGE_ROLES = {"user", "assistant", "tool", "system"}
-EMPTY_MEMORY_TEXT = "None."
+EMPTY_MEMORY_TEXT = "No memories stored yet."
 
 
 # System prompt template with dynamic placeholders:
+# - {tools}: Filled by create_agent() or defaulted by _system_message()
 # - {skills}: Injected by SkillRegistry.apply_to_system_prompt()
 # - {retrieved_memory}: Filled by LongTermMemory.read()
 # - {conversation_summary}: Optional inline summary placeholder
 SYSTEM_PROMPT_TEMPLATE = """You are Agent Runtime, a local web coding agent. Answer in Chinese. Be concise, accurate, and actionable.
+
+# Tools
+{tools}
 
 # Skills
 Use available tools when they help. After receiving tool results, answer the user directly.
@@ -136,6 +141,7 @@ class ContextEngine:
         recent_turns: int = 6,
         token_counter: TokenCounterProtocol | None = None,
         compressor: ContextCompressor | None = None,
+        on_compress: Callable[[str], None] | None = None,
     ) -> None:
         self.store = store or MemoryStore()
         self.system_prompt = system_prompt or SYSTEM_PROMPT_TEMPLATE
@@ -147,6 +153,7 @@ class ContextEngine:
         self.recent_turns = max(1, recent_turns)
         self.token_counter = token_counter or TokenCounter()
         self.compressor = compressor
+        self.on_compress = on_compress
         self._message_cache: dict[
             str,
             tuple[tuple[int, int], list[ContextMessage]],
@@ -258,6 +265,7 @@ class ContextEngine:
             messages,
             extra_input_tokens=extra_input_tokens,
         )
+        messages = self._repair_tool_call_sequence(conversation_id, messages)
         # Step 4: Serialize + insert system message
         return [
             self._system_message(conversation_id),
@@ -267,6 +275,11 @@ class ContextEngine:
     def estimate_model_input_tokens(self, conversation_id: str) -> int:
         """Estimate token count for the current model input."""
         return self.context_budget(conversation_id).used_input_tokens
+
+    def conversation_tokens(self, conversation_id: str) -> int:
+        """Return token count for conversation messages only (excluding system prompt)."""
+        messages = self._load_context_messages(conversation_id)
+        return self._message_token_count(messages)
 
     def context_budget(
         self,
@@ -311,6 +324,7 @@ class ContextEngine:
         has_summary_placeholder = "{conversation_summary}" in content
         summary = record.summary if record and record.summary else EMPTY_MEMORY_TEXT
         replacements = {
+            "{tools}": "No tools are currently available.",
             "{retrieved_memory}": self._retrieved_memory_text(conversation_id),
             "{conversation_summary}": summary,
             "{skills}": "",
@@ -474,6 +488,8 @@ class ContextEngine:
 
         older_messages, recent_messages = self._split_for_compaction(messages)
         if older_messages and self.compressor is not None:
+            if self.on_compress:
+                self.on_compress("start")
             record = self.store.get_conversation(conversation_id)
             summary_budget = max(256, self._input_token_budget() // 4)
             result = self.compressor.compress(
@@ -488,6 +504,8 @@ class ContextEngine:
                     result.summary,
                 )
                 self._message_cache.pop(conversation_id, None)
+            if self.on_compress:
+                self.on_compress("done")
 
         compacted_messages = recent_messages
         if (
@@ -620,21 +638,112 @@ class ContextEngine:
     ) -> list[ContextMessage]:
         if not messages:
             return []
-        kept: list[ContextMessage] = []
+        kept_groups: list[list[ContextMessage]] = []
         target = max(
             1,
             self._input_token_budget()
             - self._system_token_count(conversation_id)
             - extra_input_tokens,
         )
-        for message in reversed(messages):
-            candidate = [message, *kept]
-            if kept and self._message_token_count(candidate) > target:
+        groups = self._atomic_message_groups(messages)
+        for group in reversed(groups):
+            candidate_groups = [group, *kept_groups]
+            candidate = self._flatten(candidate_groups)
+            if kept_groups and self._message_token_count(candidate) > target:
                 continue
-            kept = candidate
-        if not kept:
-            kept = [messages[-1]]
-        return kept
+            kept_groups = candidate_groups
+        if not kept_groups:
+            kept_groups = [groups[-1]]
+        return self._flatten(kept_groups)
+
+    def _repair_tool_call_sequence(
+        self,
+        conversation_id: str,
+        messages: list[ContextMessage],
+    ) -> list[ContextMessage]:
+        repaired: list[ContextMessage] = []
+        changed = False
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            required_ids = self._assistant_tool_call_ids(message)
+            if not required_ids:
+                repaired.append(message)
+                index += 1
+                continue
+
+            group = [message]
+            observed_ids: set[str] = set()
+            next_index = index + 1
+            while next_index < len(messages) and messages[next_index].role == "tool":
+                tool_message = messages[next_index]
+                group.append(tool_message)
+                tool_call_id = str(tool_message.extra.get("tool_call_id", ""))
+                if tool_call_id in required_ids:
+                    observed_ids.add(tool_call_id)
+                next_index += 1
+
+            if len(group) == 1 and next_index == len(messages):
+                repaired.extend(group)
+                index = next_index
+                continue
+            if required_ids.issubset(observed_ids):
+                repaired.extend(group)
+            else:
+                changed = True
+                if message.content.strip():
+                    repaired.append(ContextMessage(role="assistant", content=message.content))
+            index = next_index
+
+        if changed:
+            self.store.replace_messages(
+                conversation_id,
+                self._storage_messages(repaired),
+            )
+            self._message_cache.pop(conversation_id, None)
+        return repaired
+
+    def _atomic_message_groups(
+        self,
+        messages: list[ContextMessage],
+    ) -> list[list[ContextMessage]]:
+        groups: list[list[ContextMessage]] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            required_ids = self._assistant_tool_call_ids(message)
+            if not required_ids:
+                groups.append([message])
+                index += 1
+                continue
+
+            group = [message]
+            observed_ids: set[str] = set()
+            next_index = index + 1
+            while next_index < len(messages) and messages[next_index].role == "tool":
+                tool_message = messages[next_index]
+                group.append(tool_message)
+                tool_call_id = str(tool_message.extra.get("tool_call_id", ""))
+                if tool_call_id in required_ids:
+                    observed_ids.add(tool_call_id)
+                next_index += 1
+                if required_ids.issubset(observed_ids):
+                    break
+            groups.append(group)
+            index = next_index
+        return groups
+
+    def _assistant_tool_call_ids(self, message: ContextMessage) -> set[str]:
+        if message.role != "assistant":
+            return set()
+        tool_calls = message.extra.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return set()
+        return {
+            str(tool_call.get("id", ""))
+            for tool_call in tool_calls
+            if isinstance(tool_call, dict) and str(tool_call.get("id", ""))
+        }
 
     def _flatten(
         self,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -17,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent_runtime.logging import runtime_log_path
+from agent_runtime.logging import format_runtime_log_content, runtime_log_path
 
 from .session import WebEvent, WebSession
 
@@ -39,6 +41,20 @@ class ConversationRequest(BaseModel):
 
     id: str | None = None
     title: str = "新对话"
+    project_id: str | None = None
+
+
+class ProjectRequest(BaseModel):
+    """Add a project directory to the web workspace."""
+
+    path: str
+    name: str | None = None
+
+
+class SelectProjectRequest(BaseModel):
+    """Select a project without creating a conversation."""
+
+    project_id: str
 
 
 class CancelRequest(BaseModel):
@@ -80,8 +96,43 @@ def create_app(session: WebSession | None = None) -> FastAPI:
     @app.get("/api/logs/runtime")
     def runtime_logs() -> JSONResponse:
         path = runtime_log_path()
+        if not path.exists():
+            return JSONResponse(
+                {"path": str(path), "content": "", "exists": False, "error": ""}
+            )
         try:
-            content = path.read_text(encoding="utf-8") if path.exists() else ""
+            size = path.stat().st_size
+            tail_bytes = 512 * 1024
+            with path.open("rb") as f:
+                if size > tail_bytes:
+                    f.seek(size - tail_bytes)
+                    f.readline()
+                content = f.read().decode("utf-8", errors="replace")
+        except OSError as exc:
+            return JSONResponse(
+                {
+                    "path": str(path),
+                    "content": "",
+                    "exists": True,
+                    "error": str(exc),
+                },
+                status_code=500,
+            )
+        return JSONResponse(
+            {
+                "path": str(path),
+                "content": format_runtime_log_content(content),
+                "exists": True,
+                "error": "",
+            }
+        )
+
+    @app.delete("/api/logs/runtime")
+    def clear_runtime_logs() -> JSONResponse:
+        path = runtime_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
         except OSError as exc:
             return JSONResponse(
                 {
@@ -93,17 +144,12 @@ def create_app(session: WebSession | None = None) -> FastAPI:
                 status_code=500,
             )
         return JSONResponse(
-            {
-                "path": str(path),
-                "content": content,
-                "exists": path.exists(),
-                "error": "",
-            }
+            {"path": str(path), "content": "", "exists": True, "error": ""}
         )
 
     @app.get("/api/conversations")
-    def conversations() -> JSONResponse:
-        return JSONResponse({"items": web_session.list_conversations()})
+    def conversations(project_id: str | None = None) -> JSONResponse:
+        return JSONResponse({"items": web_session.list_conversations(project_id)})
 
     @app.post("/api/conversations")
     def create_conversation(payload: ConversationRequest) -> JSONResponse:
@@ -111,8 +157,46 @@ def create_app(session: WebSession | None = None) -> FastAPI:
             web_session.create_conversation(
                 conversation_id=payload.id,
                 title=payload.title,
+                project_id=payload.project_id,
             )
         )
+
+    @app.get("/api/projects")
+    def projects() -> JSONResponse:
+        return JSONResponse({"items": web_session.list_projects()})
+
+    @app.post("/api/projects")
+    def create_project(payload: ProjectRequest) -> JSONResponse:
+        try:
+            return JSONResponse(web_session.add_project(payload.path, payload.name))
+        except (OSError, RuntimeError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.post("/api/projects/pick")
+    def pick_project() -> JSONResponse:
+        try:
+            path = _pick_directory()
+            if not path:
+                return JSONResponse({"cancelled": True})
+            project = web_session.add_project(path)
+            return JSONResponse({"cancelled": False, "project": project})
+        except (OSError, RuntimeError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.post("/api/projects/select")
+    def select_project(payload: SelectProjectRequest) -> JSONResponse:
+        try:
+            return JSONResponse(web_session.select_project(payload.project_id))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str) -> JSONResponse:
+        try:
+            web_session.delete_project(project_id)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        return JSONResponse({"ok": True})
 
     @app.delete("/api/conversations/{conversation_id}")
     def delete_conversation(conversation_id: str) -> JSONResponse:
@@ -144,7 +228,11 @@ def create_app(session: WebSession | None = None) -> FastAPI:
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
-    app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
+    app.mount(
+        "/assets",
+        StaticFiles(directory=STATIC_DIR / "assets", check_dir=False),
+        name="assets",
+    )
 
     @app.get("/{path:path}")
     def fallback(path: str) -> FileResponse:
@@ -174,6 +262,44 @@ def _format_sse(event: WebEvent) -> str:
 
 def _event_payload(event: WebEvent) -> dict[str, Any]:
     return {"type": event.type, **event.payload}
+
+
+def _pick_directory() -> str:
+    if sys.platform == "darwin":
+        return _pick_directory_macos()
+    return _pick_directory_tkinter()
+
+
+def _pick_directory_macos() -> str:
+    script = 'POSIX path of (choose folder with prompt "选择项目文件夹")'
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    detail = (result.stderr or result.stdout).strip()
+    if result.returncode == 1 and "-128" in detail:
+        return ""
+    raise RuntimeError(detail or "无法打开系统文件夹选择器")
+
+
+def _pick_directory_tkinter() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise RuntimeError("当前 Python 环境不支持系统文件夹选择器") from exc
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return filedialog.askdirectory(title="选择项目文件夹", mustexist=True)
+    finally:
+        root.destroy()
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:

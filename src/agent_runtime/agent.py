@@ -15,6 +15,7 @@ from agent_runtime.context import (
     TokenCounterProtocol,
 )
 from agent_runtime.config.settings import AgentRuntimeConfig
+from agent_runtime.logging import runtime_log
 from agent_runtime.mcp import MCPClientHost
 from agent_runtime.memory import (
     ConversationRecord,
@@ -28,10 +29,11 @@ from agent_runtime.memory import (
 )
 from agent_runtime.providers import OpenAIProvider, Provider
 from agent_runtime.runtime import AgentEvent, AgentLoop
-from agent_runtime.skills import SkillManifest, SkillRegistry, load_skills
+from agent_runtime.skills import SkillManifest, SkillRegistry, load_builtin_skills, load_skills
 from agent_runtime.tools import (
     ToolRegistry,
     ToolSpec,
+    list_skills_tool,
     memory_tools,
     shell_command_tool,
     skill_tools,
@@ -287,23 +289,36 @@ def create_agent(
     except AttributeError:
         pass
 
-    loaded_skills = _load_config_skills(runtime_config)
-    resolved_skill_registry = SkillRegistry([*(skills or []), *loaded_skills])
+    builtin_skills = load_builtin_skills()
+    runtime_log(
+        "skills_loaded",
+        {
+            "source": "system",
+            "path": "agent_runtime.skills.builtin",
+            "skills": [skill.name for skill in builtin_skills],
+        },
+    )
+    user_skills = [*(skills or []), *_load_config_skills(runtime_config)]
+    _check_skill_conflicts(builtin_skills, user_skills)
+    resolved_skill_registry = SkillRegistry([*builtin_skills, *user_skills])
     resolved_memory_store = memory_store or _memory_store_from_config(runtime_config)
     resolved_long_term_memory = long_term_memory or _long_term_memory_from_config(
         runtime_config,
         resolved_memory_store,
     )
     resolved_tool_registry = ToolRegistry()
+    builtin_tool_count = 0
     if runtime_config.include_memory_tools:
         for tool in memory_tools(resolved_long_term_memory):
             resolved_tool_registry.register(tool)
+            builtin_tool_count += 1
     if runtime_config.include_skill_tools:
         for tool in skill_tools(
             resolved_skill_registry,
             max_bytes=runtime_config.skill_resource_max_bytes,
         ):
             resolved_tool_registry.register(tool)
+            builtin_tool_count += 1
     if runtime_config.include_shell_tool:
         resolved_tool_registry.register(
             shell_command_tool(
@@ -311,8 +326,14 @@ def create_agent(
                 max_output_chars=runtime_config.shell_max_output_chars,
             )
         )
+        builtin_tool_count += 1
+    resolved_tool_registry.register(list_skills_tool(resolved_skill_registry))
+    builtin_tool_count += 1
     for tool in tools or []:
-        _register_if_absent(resolved_tool_registry, tool)
+        resolved_tool_registry.register(tool)
+    user_tool_count = len(tools or []) + (
+        len(mcp_host.tools()) if mcp_host is not None else 0
+    )
 
     counter_model = str(
         getattr(resolved_provider, "model", runtime_config.model or "")
@@ -325,7 +346,11 @@ def create_agent(
     )
     resolved_context = ContextEngine(
         resolved_memory_store,
-        system_prompt=resolved_skill_registry.apply_to_system_prompt(system_prompt),
+        system_prompt=_apply_tool_prompt(
+            resolved_skill_registry.apply_to_system_prompt(system_prompt),
+            total_tool_count=builtin_tool_count + user_tool_count,
+            user_tool_count=user_tool_count,
+        ),
         long_term_memory=resolved_long_term_memory,
         context_window_tokens=runtime_config.context_window_tokens,
         reserved_output_tokens=runtime_config.reserved_output_tokens,
@@ -402,13 +427,48 @@ def _long_term_memory_from_config(
 
 
 def _load_config_skills(config: AgentRuntimeConfig) -> list[SkillManifest]:
-    return [
-        skill
-        for path in config.skill_paths
-        for skill in load_skills(path)
-    ]
+    loaded: list[SkillManifest] = []
+    for path in config.skill_paths:
+        skills = load_skills(path, source="user")
+        runtime_log(
+            "skills_loaded",
+            {
+                "source": "user",
+                "path": str(path),
+                "skills": [skill.name for skill in skills],
+            },
+        )
+        loaded.extend(skills)
+    return loaded
 
 
-def _register_if_absent(registry: ToolRegistry, tool: ToolSpec) -> None:
-    if not registry.has(tool.name):
-        registry.register(tool)
+def _apply_tool_prompt(
+    prompt: str,
+    *,
+    total_tool_count: int,
+    user_tool_count: int,
+) -> str:
+    if user_tool_count == 0 and total_tool_count > 0:
+        tools_text = (
+            "No user-defined tools are loaded. Built-in system tools are still available."
+        )
+    elif total_tool_count == 0:
+        tools_text = "No tools are currently available."
+    else:
+        tools_text = "User-defined tools are loaded alongside built-in system tools."
+    if "{tools}" in prompt:
+        return prompt.replace("{tools}", tools_text)
+    return f"{prompt}\n\n# Tools\n{tools_text}"
+
+
+def _check_skill_conflicts(
+    builtin_skills: list[SkillManifest],
+    user_skills: list[SkillManifest],
+) -> None:
+    builtin_names = {s.name for s in builtin_skills}
+    for skill in user_skills:
+        if skill.name in builtin_names:
+            raise ValueError(
+                f"Skill name conflict: '{skill.name}' conflicts with a "
+                f"built-in system skill. Please rename your skill."
+            )
