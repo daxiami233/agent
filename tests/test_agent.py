@@ -337,6 +337,7 @@ def test_create_agent_registers_optional_runtime_tools(tmp_path):
         "skill_read",
         "skill_read_resource",
         "shell_command",
+        "apply_patch",
     }.issubset(tool_names)
 
 
@@ -364,6 +365,7 @@ def test_create_agent_enables_core_local_tools_by_default(tmp_path):
         "skill_read",
         "skill_read_resource",
         "shell_command",
+        "apply_patch",
     }.issubset(tool_names)
     assert "weather" not in tool_names
 

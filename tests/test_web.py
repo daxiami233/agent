@@ -726,6 +726,7 @@ def test_web_session_exposes_agent_core_tools_by_default(tmp_path):
         "skill_read",
         "skill_read_resource",
         "shell_command",
+        "apply_patch",
     }.issubset(tool_names)
 
 

@@ -231,6 +231,7 @@ class WebSession:
         include_memory_tools: bool = True,
         include_skill_tools: bool = True,
         include_shell_tool: bool = True,
+        include_apply_patch_tool: bool = True,
     ) -> None:
         self.provider_factory = provider_factory
         self.provider: OpenAIProvider | None = None
@@ -256,6 +257,7 @@ class WebSession:
                     "include_memory_tools": include_memory_tools,
                     "include_skill_tools": include_skill_tools,
                     "include_shell_tool": include_shell_tool,
+                    "include_apply_patch_tool": include_apply_patch_tool,
                     "default_project": self.default_project.path,
                 },
         )
@@ -273,6 +275,7 @@ class WebSession:
                 include_memory_tools=include_memory_tools,
                 include_skill_tools=include_skill_tools,
                 include_shell_tool=include_shell_tool,
+                include_apply_patch_tool=include_apply_patch_tool,
             )
             self.agent = create_agent(
                 config=runtime_config,

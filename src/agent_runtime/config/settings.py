@@ -133,6 +133,9 @@ class AgentRuntimeConfig:
     # Whether to register the local shell execution tool by default.
     include_shell_tool: bool = True
 
+    # Whether to register the local patch application tool by default.
+    include_apply_patch_tool: bool = True
+
     # Skill directories. In .env, multiple paths use the OS path separator.
     skill_paths: list[str] = field(default_factory=list)
 
@@ -214,6 +217,7 @@ class AgentRuntimeConfig:
             include_memory_tools=_env_bool("ENABLE_MEMORY_TOOLS", True),
             include_skill_tools=_env_bool("ENABLE_SKILL_TOOLS", True),
             include_shell_tool=_env_bool("ENABLE_SHELL_TOOL", True),
+            include_apply_patch_tool=_env_bool("ENABLE_APPLY_PATCH_TOOL", True),
             skill_paths=_env_list("SKILL_PATHS"),
             shell_timeout_seconds=_env_int(
                 "SHELL_TIMEOUT_SECONDS",

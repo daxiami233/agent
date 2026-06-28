@@ -33,6 +33,7 @@ from agent_runtime.skills import SkillManifest, SkillRegistry, load_builtin_skil
 from agent_runtime.tools import (
     ToolRegistry,
     ToolSpec,
+    apply_patch_tool,
     list_skills_tool,
     memory_tools,
     shell_command_tool,
@@ -327,6 +328,9 @@ def create_agent(
                 artifact_dir=runtime_config.data_dir / "artifacts",
             )
         )
+        builtin_tool_count += 1
+    if runtime_config.include_apply_patch_tool:
+        resolved_tool_registry.register(apply_patch_tool())
         builtin_tool_count += 1
     resolved_tool_registry.register(list_skills_tool(resolved_skill_registry))
     builtin_tool_count += 1
