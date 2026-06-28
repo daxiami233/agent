@@ -324,6 +324,7 @@ def create_agent(
             shell_command_tool(
                 timeout_seconds=runtime_config.shell_timeout_seconds,
                 max_output_chars=runtime_config.shell_max_output_chars,
+                artifact_dir=runtime_config.data_dir / "artifacts",
             )
         )
         builtin_tool_count += 1
@@ -357,6 +358,7 @@ def create_agent(
         safety_margin_tokens=runtime_config.safety_margin_tokens,
         compact_threshold_ratio=runtime_config.compact_threshold_ratio,
         recent_turns=runtime_config.recent_turns,
+        raw_keep_ratio=runtime_config.raw_keep_ratio,
         token_counter=resolved_token_counter,
         compressor=resolved_compressor,
     )

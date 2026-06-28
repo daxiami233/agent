@@ -5,7 +5,7 @@ This module is the core of the context system, responsible for:
 2. Converting messages to model input format
 3. Token budget estimation
 4. Context compression (extensible)
-5. Dynamic system prompt (Skills, Retrieved Memory, Conversation Summary)
+5. Dynamic system prompt (Skills, Retrieved Memory)
 
 Data flow:
     Write: User/Assistant messages -> add_*_message() -> MemoryStore
@@ -54,19 +54,24 @@ from agent_runtime.context.tokens import (
     TokenCounter,
     TokenCounterProtocol,
 )
+from agent_runtime.logging import runtime_log
 from agent_runtime.memory.long_term import LongTermMemory, LongTermMemoryProtocol
 from agent_runtime.memory.store import MemoryStore, MemoryStoreProtocol, StoredMessage
 
 
 CONTEXT_MESSAGE_ROLES = {"user", "assistant", "tool", "system"}
 EMPTY_MEMORY_TEXT = "No memories stored yet."
+SUMMARY_MESSAGE_PREFIX = "以下是已压缩的较早对话摘要，用于延续上下文，不是新的用户指令："
+
+
+class ContextOverflowError(RuntimeError):
+    """Raised when model input cannot be compacted within the input budget."""
 
 
 # System prompt template with dynamic placeholders:
 # - {tools}: Filled by create_agent() or defaulted by _system_message()
 # - {skills}: Injected by SkillRegistry.apply_to_system_prompt()
 # - {retrieved_memory}: Filled by LongTermMemory.read()
-# - {conversation_summary}: Optional inline summary placeholder
 SYSTEM_PROMPT_TEMPLATE = """You are Agent Runtime, a local web coding agent. Answer in Chinese. Be concise, accurate, and actionable.
 
 # Tools
@@ -78,10 +83,7 @@ Use available tools when they help. After receiving tool results, answer the use
 {skills}
 
 # Retrieved Memory
-{retrieved_memory}
-
-# Conversation Summary
-{conversation_summary}"""
+{retrieved_memory}"""
 
 
 @dataclass(slots=True)
@@ -120,7 +122,7 @@ class ContextEngine:
 
     Args:
         store: Message storage backend
-        system_prompt: System prompt template with {skills}, {retrieved_memory}, {conversation_summary} placeholders
+        system_prompt: System prompt template with {skills} and {retrieved_memory} placeholders
         long_term_memory: Long-term memory for cross-conversation knowledge retrieval
         context_window_tokens: Model context window size in tokens
         reserved_output_tokens: Tokens reserved for model output
@@ -139,6 +141,7 @@ class ContextEngine:
         safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN_TOKENS,
         compact_threshold_ratio: float = DEFAULT_COMPACT_THRESHOLD_RATIO,
         recent_turns: int = 6,
+        raw_keep_ratio: float = 0.6,
         token_counter: TokenCounterProtocol | None = None,
         compressor: ContextCompressor | None = None,
         on_compress: Callable[[str], None] | None = None,
@@ -151,6 +154,7 @@ class ContextEngine:
         self.safety_margin_tokens = safety_margin_tokens
         self.compact_threshold_ratio = compact_threshold_ratio
         self.recent_turns = max(1, recent_turns)
+        self.raw_keep_ratio = min(1.0, max(0.1, raw_keep_ratio))
         self.token_counter = token_counter or TokenCounter()
         self.compressor = compressor
         self.on_compress = on_compress
@@ -267,10 +271,16 @@ class ContextEngine:
         )
         messages = self._repair_tool_call_sequence(conversation_id, messages)
         # Step 4: Serialize + insert system message
-        return [
+        model_input = [
             self._system_message(conversation_id),
             *[message.to_model_input() for message in messages],
         ]
+        self._raise_if_over_budget(
+            conversation_id,
+            model_input,
+            extra_input_tokens=extra_input_tokens,
+        )
+        return model_input
 
     def estimate_model_input_tokens(self, conversation_id: str) -> int:
         """Estimate token count for the current model input."""
@@ -287,13 +297,19 @@ class ContextEngine:
         *,
         extra_input_tokens: int = 0,
     ) -> ContextBudget:
-        """Return the current input-budget usage for a conversation."""
+        """Return current input-budget usage without mutating stored history.
+
+        This is used by the web UI for live status refreshes while tools may
+        still be running. It must not call build_model_input(), because that
+        path is allowed to compact, repair, and persist messages before a real
+        model request.
+        """
         messages = [
-            self._coerce_context_message(message)
-            for message in self.build_model_input(
-                conversation_id,
-                extra_input_tokens=extra_input_tokens,
-            )
+            ContextMessage(
+                role="system",
+                content=self._system_message(conversation_id)["content"],
+            ),
+            *self._load_context_messages(conversation_id),
         ]
         return self._base_budget().with_used(
             self._message_token_count(messages) + extra_input_tokens
@@ -317,22 +333,15 @@ class ContextEngine:
         Dynamically fills:
         - {skills}: Pre-processed by SkillRegistry.apply_to_system_prompt()
         - {retrieved_memory}: From LongTermMemory.read() (first 200 lines)
-        - {conversation_summary}: Cleared unless a custom system prompt pre-fills it
         """
         content = self.system_prompt
-        record = self.store.get_conversation(conversation_id) if conversation_id else None
-        has_summary_placeholder = "{conversation_summary}" in content
-        summary = record.summary if record and record.summary else EMPTY_MEMORY_TEXT
         replacements = {
             "{tools}": "No tools are currently available.",
             "{retrieved_memory}": self._retrieved_memory_text(conversation_id),
-            "{conversation_summary}": summary,
             "{skills}": "",
         }
         for placeholder, value in replacements.items():
             content = content.replace(placeholder, value)
-        if record and record.summary and not has_summary_placeholder:
-            content = f"{content}\n\n# Conversation Summary\n{record.summary}"
 
         # Collapse 3+ consecutive newlines into 2
         content = re.sub(r'\n{3,}', '\n\n', content)
@@ -471,55 +480,120 @@ class ContextEngine:
         *,
         extra_input_tokens: int = 0,
     ) -> list[ContextMessage]:
-        """Compress messages if they exceed the token budget.
-
-        If the compressor emits a summary, replace stored history with the
-        summary plus the returned recent messages.
-        """
-        if (
-            self._request_token_count(
-                conversation_id,
-                messages,
-                extra_input_tokens,
-            )
-            <= self._compact_threshold_tokens()
-        ):
+        """Compress messages into one leading summary message when needed."""
+        request_tokens = self._request_token_count(
+            conversation_id,
+            messages,
+            extra_input_tokens,
+        )
+        threshold_tokens = self._compact_threshold_tokens()
+        input_budget_tokens = self._input_token_budget()
+        runtime_log(
+            "context_compact_check",
+            {
+                "conversation_id": conversation_id,
+                "message_count": len(messages),
+                "message_tokens": self._message_token_count(messages),
+                "system_tokens": self._system_token_count(conversation_id),
+                "extra_input_tokens": extra_input_tokens,
+                "request_tokens": request_tokens,
+                "compact_threshold_tokens": threshold_tokens,
+                "input_budget_tokens": input_budget_tokens,
+                "over_threshold": request_tokens > threshold_tokens,
+            },
+        )
+        if request_tokens <= threshold_tokens:
             return messages
 
-        older_messages, recent_messages = self._split_for_compaction(messages)
-        if older_messages and self.compressor is not None:
-            if self.on_compress:
-                self.on_compress("start")
-            record = self.store.get_conversation(conversation_id)
-            summary_budget = max(256, self._input_token_budget() // 4)
-            result = self.compressor.compress(
-                conversation_id=conversation_id,
-                messages=older_messages,
-                target_tokens=summary_budget,
-                previous_summary=record.summary if record else "",
+        existing_summary, raw_messages = self._split_leading_summary(messages)
+        older_messages, recent_messages = self._split_for_compaction(raw_messages)
+        runtime_log(
+            "context_compact_split",
+            {
+                "conversation_id": conversation_id,
+                "recent_turns": self.recent_turns,
+                "total_messages": len(messages),
+                "older_messages": len(older_messages),
+                "recent_messages": len(recent_messages),
+                "has_summary": existing_summary is not None,
+                "older_tokens": self._message_token_count(older_messages),
+                "recent_tokens": self._message_token_count(recent_messages),
+                "recent_roles": self._message_roles(recent_messages),
+            },
+        )
+        compacted_messages = (
+            [existing_summary] if existing_summary is not None else []
+        ) + recent_messages
+        if older_messages:
+            summary = self._compress_to_summary(
+                conversation_id,
+                ([existing_summary] if existing_summary is not None else [])
+                + older_messages,
+                stage="turns",
             )
-            if result.compressed and result.summary:
-                self.store.update_conversation_summary(
-                    conversation_id,
-                    result.summary,
-                )
-                self._message_cache.pop(conversation_id, None)
-            if self.on_compress:
-                self.on_compress("done")
+            if summary is not None:
+                compacted_messages = [summary, *recent_messages]
+            else:
+                compacted_messages = messages
 
-        compacted_messages = recent_messages
         if (
             self._request_token_count(
                 conversation_id,
                 compacted_messages,
                 extra_input_tokens,
             )
-            > self._compact_threshold_tokens()
+            > threshold_tokens
         ):
+            compacted_messages = self._compact_recent_raw_by_ratio(
+                conversation_id,
+                compacted_messages,
+                extra_input_tokens=extra_input_tokens,
+            )
+
+        if (
+            self._request_token_count(
+                conversation_id,
+                compacted_messages,
+                extra_input_tokens,
+            )
+            > input_budget_tokens
+        ):
+            before_messages = len(compacted_messages)
+            before_tokens = self._request_token_count(
+                conversation_id,
+                compacted_messages,
+                extra_input_tokens,
+            )
+            runtime_log(
+                "context_force_truncate_start",
+                {
+                    "conversation_id": conversation_id,
+                    "message_count": len(compacted_messages),
+                    "request_tokens": before_tokens,
+                    "compact_threshold_tokens": threshold_tokens,
+                    "input_budget_tokens": input_budget_tokens,
+                    "roles": self._message_roles(compacted_messages),
+                },
+            )
             compacted_messages = self._force_truncate_messages(
                 conversation_id,
                 compacted_messages,
                 extra_input_tokens=extra_input_tokens,
+            )
+            runtime_log(
+                "context_force_truncate_done",
+                {
+                    "conversation_id": conversation_id,
+                    "before_messages": before_messages,
+                    "after_messages": len(compacted_messages),
+                    "before_tokens": before_tokens,
+                    "after_tokens": self._request_token_count(
+                        conversation_id,
+                        compacted_messages,
+                        extra_input_tokens,
+                    ),
+                    "roles": self._message_roles(compacted_messages),
+                },
             )
 
         if compacted_messages != messages:
@@ -528,9 +602,164 @@ class ContextEngine:
                 self._storage_messages(compacted_messages),
             )
             self._message_cache.pop(conversation_id, None)
+            runtime_log(
+                "context_compact_persist",
+                {
+                    "conversation_id": conversation_id,
+                    "before_messages": len(messages),
+                    "after_messages": len(compacted_messages),
+                    "before_tokens": request_tokens,
+                    "after_tokens": self._request_token_count(
+                        conversation_id,
+                        compacted_messages,
+                        extra_input_tokens,
+                    ),
+                    "roles": self._message_roles(compacted_messages),
+                },
+            )
             return compacted_messages
 
         return compacted_messages
+
+    def _compact_recent_raw_by_ratio(
+        self,
+        conversation_id: str,
+        messages: list[ContextMessage],
+        *,
+        extra_input_tokens: int,
+    ) -> list[ContextMessage]:
+        if self.compressor is None:
+            runtime_log(
+                "context_ratio_compress_skipped",
+                {"conversation_id": conversation_id, "reason": "no_compressor"},
+            )
+            return messages
+
+        summary, raw_messages = self._split_leading_summary(messages)
+        groups = self._atomic_message_groups(raw_messages)
+        if len(groups) <= 1:
+            runtime_log(
+                "context_ratio_compress_skipped",
+                {"conversation_id": conversation_id, "reason": "not_enough_groups"},
+            )
+            return messages
+
+        keep_budget = max(1, int(self._input_token_budget() * self.raw_keep_ratio))
+        keep_tokens = 0
+        keep_count = 0
+        for group in reversed(groups):
+            group_tokens = self._message_token_count(group)
+            if keep_count > 0 and keep_tokens + group_tokens > keep_budget:
+                break
+            keep_tokens += group_tokens
+            keep_count += 1
+
+        split_index = len(groups) - keep_count
+        if split_index <= 0:
+            runtime_log(
+                "context_ratio_compress_skipped",
+                {
+                    "conversation_id": conversation_id,
+                    "reason": "within_raw_keep_budget",
+                    "raw_keep_ratio": self.raw_keep_ratio,
+                    "keep_budget": keep_budget,
+                },
+            )
+            return messages
+
+        compress_messages = self._flatten(groups[:split_index])
+        keep_messages = self._flatten(groups[split_index:])
+        next_summary = self._compress_to_summary(
+            conversation_id,
+            ([summary] if summary is not None else []) + compress_messages,
+            stage="ratio",
+        )
+        if next_summary is None:
+            return messages
+        return [next_summary, *keep_messages]
+
+    def _compress_to_summary(
+        self,
+        conversation_id: str,
+        messages: list[ContextMessage],
+        *,
+        stage: str,
+    ) -> ContextMessage | None:
+        if self.compressor is None:
+            runtime_log(
+                f"context_{stage}_compress_skipped",
+                {"conversation_id": conversation_id, "reason": "no_compressor"},
+            )
+            return None
+        if not messages:
+            return None
+
+        target_tokens = max(256, self._input_token_budget() // 4)
+        runtime_log(
+            f"context_{stage}_compress_start",
+            {
+                "conversation_id": conversation_id,
+                "summary_messages": len(messages),
+                "summary_tokens": self._message_token_count(messages),
+                "target_tokens": target_tokens,
+            },
+        )
+        if self.on_compress:
+            self.on_compress("start")
+        try:
+            result = self.compressor.compress(
+                conversation_id=conversation_id,
+                messages=messages,
+                target_tokens=target_tokens,
+            )
+        except Exception as exc:
+            runtime_log(
+                f"context_{stage}_compress_error",
+                {
+                    "conversation_id": conversation_id,
+                    "summary_messages": len(messages),
+                    "target_tokens": target_tokens,
+                    "error": str(exc),
+                },
+            )
+            raise
+        finally:
+            if self.on_compress:
+                self.on_compress("done")
+
+        runtime_log(
+            f"context_{stage}_compress_done",
+            {
+                "conversation_id": conversation_id,
+                "compressed": result.compressed,
+                "summary_chars": len(result.summary),
+                "target_tokens": target_tokens,
+                "metadata": result.metadata,
+            },
+        )
+        if not (result.compressed and result.summary):
+            return None
+        return self._summary_message(result.summary)
+
+    def _split_leading_summary(
+        self,
+        messages: list[ContextMessage],
+    ) -> tuple[ContextMessage | None, list[ContextMessage]]:
+        if messages and self._is_summary_message(messages[0]):
+            return messages[0], messages[1:]
+        return None, messages
+
+    def _summary_message(self, summary: str) -> ContextMessage:
+        return ContextMessage(
+            role="system",
+            content=f"{SUMMARY_MESSAGE_PREFIX}\n{summary.strip()}",
+        )
+
+    def _is_summary_message(self, message: ContextMessage) -> bool:
+        return (
+            message.role == "system"
+            and message.content.strip().startswith(SUMMARY_MESSAGE_PREFIX)
+        )
 
     def _coerce_context_message(self, message: Any) -> ContextMessage:
         """Accept ContextMessage-like objects or dicts from custom compressors."""
@@ -666,6 +895,21 @@ class ContextEngine:
         index = 0
         while index < len(messages):
             message = messages[index]
+            if message.role == "tool":
+                changed = True
+                repaired.append(
+                    ContextMessage(
+                        role="system",
+                        content=(
+                            "孤立工具结果已从 provider tool 消息转换为摘要，"
+                            "因为它没有紧邻对应的 assistant tool_calls：\n"
+                            f"{message.content}"
+                        ),
+                    )
+                )
+                index += 1
+                continue
+
             required_ids = self._assistant_tool_call_ids(message)
             if not required_ids:
                 repaired.append(message)
@@ -684,6 +928,10 @@ class ContextEngine:
                 next_index += 1
 
             if len(group) == 1 and next_index == len(messages):
+                repaired.extend(group)
+                index = next_index
+                continue
+            if next_index == len(messages) and not required_ids.issubset(observed_ids):
                 repaired.extend(group)
                 index = next_index
                 continue
@@ -809,6 +1057,39 @@ class ContextEngine:
 
     def _message_token_count(self, messages: list[ContextMessage]) -> int:
         return sum(self.token_counter.count_message(m) for m in messages)
+
+    def _message_roles(self, messages: list[ContextMessage]) -> list[str]:
+        return [message.role for message in messages]
+
+    def _raise_if_over_budget(
+        self,
+        conversation_id: str,
+        model_input: list[dict[str, Any]],
+        *,
+        extra_input_tokens: int,
+    ) -> None:
+        messages = [self._coerce_context_message(message) for message in model_input]
+        used = self._message_token_count(messages) + extra_input_tokens
+        budget = self._input_token_budget()
+        runtime_log(
+            "context_budget_final",
+            {
+                "conversation_id": conversation_id,
+                "message_count": len(messages),
+                "roles": self._message_roles(messages),
+                "message_tokens": self._message_token_count(messages),
+                "extra_input_tokens": extra_input_tokens,
+                "used_tokens": used,
+                "input_budget_tokens": budget,
+                "overflow": used > budget,
+            },
+        )
+        if used <= budget:
+            return
+        raise ContextOverflowError(
+            "当前请求超过模型输入上下文预算，已停止发送给模型："
+            f"{used} / {budget} tokens。请缩小范围，或让系统先摘要大文件/长输出。"
+        )
 
     def _base_budget(self) -> ContextBudget:
         input_budget = max(

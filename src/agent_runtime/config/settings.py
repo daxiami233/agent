@@ -21,6 +21,7 @@ DEFAULT_DATA_DIR = Path.home() / ".agent-runtime"
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 60.0
 DEFAULT_PROVIDER_MAX_RETRIES = 2
 DEFAULT_COMPACT_SUMMARY_TOKENS = 1_200
+DEFAULT_RAW_KEEP_RATIO = 0.6
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
 DEFAULT_SHELL_MAX_OUTPUT_CHARS = 20_000
 
@@ -47,6 +48,7 @@ class AgentRuntimeConfig:
         compact_threshold_ratio: Ratio of input budget that triggers compaction.
         recent_turns: Recent conversation turns kept verbatim during compaction.
         compact_summary_tokens: Maximum tokens used when creating summaries.
+        raw_keep_ratio: Ratio of input budget kept as raw recent messages after summary.
         memory_backend: ``"sqlite"`` for persistence or ``"memory"`` for
             process-local storage.
         long_term_memory_max_lines: Lines injected from long-term memory.
@@ -113,6 +115,9 @@ class AgentRuntimeConfig:
     # Maximum tokens requested when summarizing older context.
     compact_summary_tokens: int = DEFAULT_COMPACT_SUMMARY_TOKENS
 
+    # Ratio of input budget kept as raw recent messages after summary compaction.
+    raw_keep_ratio: float = DEFAULT_RAW_KEEP_RATIO
+
     # Memory backend: "sqlite" persists under data_dir, "memory" is process-local.
     memory_backend: MemoryBackend = "sqlite"
 
@@ -159,6 +164,7 @@ class AgentRuntimeConfig:
         )
         self.recent_turns = max(1, int(self.recent_turns))
         self.compact_summary_tokens = max(256, int(self.compact_summary_tokens))
+        self.raw_keep_ratio = min(1.0, max(0.1, float(self.raw_keep_ratio)))
         self.long_term_memory_max_lines = max(1, int(self.long_term_memory_max_lines))
         self.shell_timeout_seconds = max(1, int(self.shell_timeout_seconds))
         self.shell_max_output_chars = max(1, int(self.shell_max_output_chars))
@@ -199,6 +205,7 @@ class AgentRuntimeConfig:
                 "COMPACT_SUMMARY_TOKENS",
                 DEFAULT_COMPACT_SUMMARY_TOKENS,
             ),
+            raw_keep_ratio=_env_float("RAW_KEEP_RATIO", DEFAULT_RAW_KEEP_RATIO),
             memory_backend=_env_memory_backend("MEMORY_BACKEND", "sqlite"),
             long_term_memory_max_lines=_env_int(
                 "LONG_TERM_MEMORY_MAX_LINES",

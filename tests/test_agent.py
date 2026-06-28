@@ -47,7 +47,7 @@ class FixedTokenCounter:
 
 
 class FixedCompressor(ContextCompressor):
-    def compress(self, *, conversation_id, messages, target_tokens, previous_summary=""):
+    def compress(self, *, conversation_id, messages, target_tokens):
         return CompressionResult(summary="compressed", compressed=True)
 
 

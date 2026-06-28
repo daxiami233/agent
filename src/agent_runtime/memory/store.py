@@ -1,7 +1,7 @@
 """Conversation memory stores.
 
 This module owns short-term conversation persistence: conversation metadata,
-chat messages, memory snapshots, and compression summaries.
+chat messages, and memory snapshots.
 
 The SDK exposes only a storage choice through ``AgentRuntimeConfig``:
 
@@ -35,9 +35,6 @@ class ConversationRecord:
     created_at: float
     updated_at: float
     memory_snapshot: str = ""
-    summary: str = ""
-    summary_updated_at: float = 0.0
-    last_compacted_message_id: int = 0
 
 
 @dataclass(slots=True)
@@ -78,23 +75,11 @@ class MemoryStoreProtocol(Protocol):
     def ensure_memory_snapshot(self, conversation_id: str, snapshot: str) -> str:
         """Persist the first retrieved-memory snapshot for a conversation."""
 
-    def update_conversation_summary(
-        self,
-        conversation_id: str,
-        summary: str,
-        *,
-        last_compacted_message_id: int = 0,
-    ) -> None:
-        """Persist the compacted summary for older conversation turns."""
-
-    def clear_conversation_summary(self, conversation_id: str) -> None:
-        """Clear compacted summary metadata while keeping messages."""
-
     def delete_conversation(self, conversation_id: str) -> None:
         """Delete a conversation and all of its messages."""
 
     def clear_conversation(self, conversation_id: str) -> None:
-        """Delete all messages in a conversation and reset summary metadata."""
+        """Delete all messages in a conversation."""
 
     def append_message(self, conversation_id: str, role: str, content: str) -> StoredMessage:
         """Append one role/content message."""
@@ -146,8 +131,7 @@ class SQLiteMemoryStore:
             self._ensure_conversation(conn, conversation_id, title, now)
             row = conn.execute(
                 """
-                SELECT id, title, created_at, updated_at, memory_snapshot,
-                    summary, summary_updated_at, last_compacted_message_id
+                SELECT id, title, created_at, updated_at, memory_snapshot
                 FROM conversations
                 WHERE id = ?
                 """,
@@ -159,8 +143,7 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, title, created_at, updated_at, memory_snapshot,
-                    summary, summary_updated_at, last_compacted_message_id
+                SELECT id, title, created_at, updated_at, memory_snapshot
                 FROM conversations
                 ORDER BY updated_at DESC, created_at DESC
                 """
@@ -171,8 +154,7 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, title, created_at, updated_at, memory_snapshot,
-                    summary, summary_updated_at, last_compacted_message_id
+                SELECT id, title, created_at, updated_at, memory_snapshot
                 FROM conversations
                 WHERE id = ?
                 """,
@@ -213,40 +195,6 @@ class SQLiteMemoryStore:
             )
             return snapshot
 
-    def update_conversation_summary(
-        self,
-        conversation_id: str,
-        summary: str,
-        *,
-        last_compacted_message_id: int = 0,
-    ) -> None:
-        now = time.time()
-        with self._lock, self._connect() as conn:
-            self._ensure_conversation(conn, conversation_id, "新对话", now)
-            conn.execute(
-                """
-                UPDATE conversations
-                SET summary = ?, summary_updated_at = ?,
-                    last_compacted_message_id = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (summary, now, last_compacted_message_id, now, conversation_id),
-            )
-
-    def clear_conversation_summary(self, conversation_id: str) -> None:
-        now = time.time()
-        with self._lock, self._connect() as conn:
-            self._ensure_conversation(conn, conversation_id, "新对话", now)
-            conn.execute(
-                """
-                UPDATE conversations
-                SET summary = '', summary_updated_at = 0,
-                    last_compacted_message_id = 0, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, conversation_id),
-            )
-
     def delete_conversation(self, conversation_id: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -266,8 +214,7 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 UPDATE conversations
-                SET updated_at = ?, summary = '', summary_updated_at = 0,
-                    last_compacted_message_id = 0
+                SET updated_at = ?
                 WHERE id = ?
                 """,
                 (now, conversation_id),
@@ -377,10 +324,7 @@ class SQLiteMemoryStore:
                     title TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    memory_snapshot TEXT NOT NULL DEFAULT '',
-                    summary TEXT NOT NULL DEFAULT '',
-                    summary_updated_at REAL NOT NULL DEFAULT 0,
-                    last_compacted_message_id INTEGER NOT NULL DEFAULT 0
+                    memory_snapshot TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -409,9 +353,6 @@ class SQLiteMemoryStore:
         columns = {str(row[1]) for row in rows}
         migrations = {
             "memory_snapshot": "ALTER TABLE conversations ADD COLUMN memory_snapshot TEXT NOT NULL DEFAULT ''",
-            "summary": "ALTER TABLE conversations ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
-            "summary_updated_at": "ALTER TABLE conversations ADD COLUMN summary_updated_at REAL NOT NULL DEFAULT 0",
-            "last_compacted_message_id": "ALTER TABLE conversations ADD COLUMN last_compacted_message_id INTEGER NOT NULL DEFAULT 0",
         }
         for column, sql in migrations.items():
             if column not in columns:
@@ -444,9 +385,6 @@ class SQLiteMemoryStore:
             created_at=float(row[2]),
             updated_at=float(row[3]),
             memory_snapshot=str(row[4] or "") if len(row) > 4 else "",
-            summary=str(row[5] or "") if len(row) > 5 else "",
-            summary_updated_at=float(row[6] or 0) if len(row) > 6 else 0.0,
-            last_compacted_message_id=int(row[7] or 0) if len(row) > 7 else 0,
         )
 
     def _message_from_row(self, row: sqlite3.Row | tuple[object, ...]) -> StoredMessage:
@@ -526,36 +464,6 @@ class InMemoryMemoryStore:
             )
             return snapshot
 
-    def update_conversation_summary(
-        self,
-        conversation_id: str,
-        summary: str,
-        *,
-        last_compacted_message_id: int = 0,
-    ) -> None:
-        now = time.time()
-        with self._lock:
-            record = self.create_conversation(conversation_id)
-            self._conversations[conversation_id] = replace(
-                record,
-                summary=summary,
-                summary_updated_at=now,
-                last_compacted_message_id=last_compacted_message_id,
-                updated_at=now,
-            )
-
-    def clear_conversation_summary(self, conversation_id: str) -> None:
-        now = time.time()
-        with self._lock:
-            record = self.create_conversation(conversation_id)
-            self._conversations[conversation_id] = replace(
-                record,
-                summary="",
-                summary_updated_at=0.0,
-                last_compacted_message_id=0,
-                updated_at=now,
-            )
-
     def delete_conversation(self, conversation_id: str) -> None:
         with self._lock:
             self._conversations.pop(conversation_id, None)
@@ -569,9 +477,6 @@ class InMemoryMemoryStore:
             self._conversations[conversation_id] = replace(
                 record,
                 updated_at=now,
-                summary="",
-                summary_updated_at=0.0,
-                last_compacted_message_id=0,
             )
 
     def append_message(self, conversation_id: str, role: str, content: str) -> StoredMessage:
@@ -639,4 +544,3 @@ class InMemoryMemoryStore:
 # Backwards-compatible name for existing imports. New code should prefer the
 # explicit SQLiteMemoryStore or MemoryStoreProtocol names.
 MemoryStore = SQLiteMemoryStore
-

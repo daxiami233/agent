@@ -27,7 +27,7 @@ from .manifest import SkillManifest
 
 
 # 默认系统提示词模板
-# 使用 {tools}、{skills}、{retrieved_memory}、{conversation_summary} 作为占位符
+# 使用 {tools}、{skills}、{retrieved_memory} 作为占位符
 DEFAULT_SYSTEM_PROMPT = """You are Agent Runtime, a local agent. Answer in Chinese. Be concise, accurate, and actionable.
 
 # Tools
@@ -39,10 +39,7 @@ Use available tools and skills when they help. After receiving tool results, ans
 {skills}
 
 # Retrieved Memory
-{retrieved_memory}
-
-# Conversation Summary
-{conversation_summary}"""
+{retrieved_memory}"""
 
 
 class SkillRegistry:

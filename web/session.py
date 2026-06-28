@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -261,16 +261,21 @@ class WebSession:
         )
         try:
             self.provider = self.provider_factory()
+            runtime_config = AgentRuntimeConfig.from_env()
+            provider_context_window = getattr(self.provider, "context_window_tokens", None)
+            if provider_context_window:
+                runtime_config = replace(
+                    runtime_config,
+                    context_window_tokens=int(provider_context_window),
+                )
+            runtime_config = replace(
+                runtime_config,
+                include_memory_tools=include_memory_tools,
+                include_skill_tools=include_skill_tools,
+                include_shell_tool=include_shell_tool,
+            )
             self.agent = create_agent(
-                config=AgentRuntimeConfig(
-                    context_window_tokens=int(
-                        getattr(self.provider, "context_window_tokens", None)
-                        or AgentRuntimeConfig().context_window_tokens
-                    ),
-                    include_memory_tools=include_memory_tools,
-                    include_skill_tools=include_skill_tools,
-                    include_shell_tool=include_shell_tool,
-                ),
+                config=runtime_config,
                 provider=self.provider,
                 tools=self.tool_registry.list(),
                 skills=self.skill_registry.list(),
@@ -490,8 +495,16 @@ class WebSession:
                 yield WebEvent("status", self._context_window_payload(conversation_id))
                 continue
             yield WebEvent(event.type, event.payload)
+            if event.type == "tool_call_result" or self._is_context_notice(event):
+                yield WebEvent("status", self._context_window_payload(conversation_id))
 
         yield from self._drain_output_events()
+
+    def _is_context_notice(self, event: Any) -> bool:
+        if event.type != "notice":
+            return False
+        text = str(event.payload.get("text", ""))
+        return "上下文" in text
 
     def _build_commands(self) -> CommandRegistry:
         registry = CommandRegistry()

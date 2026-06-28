@@ -43,7 +43,6 @@ class ContextCompressor:
         conversation_id: str,
         messages: list[ContextMessageLike],
         target_tokens: int,
-        previous_summary: str = "",
     ) -> CompressionResult:
         raise NotImplementedError
 
@@ -68,9 +67,8 @@ class ModelContextCompressor(ContextCompressor):
         conversation_id: str,
         messages: list[ContextMessageLike],
         target_tokens: int,
-        previous_summary: str = "",
     ) -> CompressionResult:
-        if not messages and not previous_summary.strip():
+        if not messages:
             return CompressionResult(
                 metadata={
                     "conversation_id": conversation_id,
@@ -87,10 +85,7 @@ class ModelContextCompressor(ContextCompressor):
                 },
                 {
                     "role": "user",
-                    "content": _summary_user_prompt(
-                        previous_summary=previous_summary,
-                        messages=messages,
-                    ),
+                    "content": _summary_user_prompt(messages=messages),
                 },
             ],
             tools=[],
@@ -124,11 +119,9 @@ def _summary_system_prompt(target_tokens: int) -> str:
 
 def _summary_user_prompt(
     *,
-    previous_summary: str,
     messages: list[ContextMessageLike],
 ) -> str:
     payload = {
-        "previous_summary": previous_summary.strip(),
         "messages_to_summarize": [
             {
                 "role": str(getattr(message, "role", "")),

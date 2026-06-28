@@ -21,14 +21,29 @@ NOISY_EVENTS = {
     "model_tool_call_delta",
 }
 TOKEN_COUNT_KEYS = {
+    "after_tokens",
+    "before_tokens",
+    "budget_tokens",
     "completion_tokens",
+    "compact_threshold_tokens",
     "context_window_tokens",
+    "extra_input_tokens",
     "input_budget_tokens",
     "input_tokens",
+    "message_tokens",
     "output_tokens",
     "prompt_tokens",
     "reasoning_tokens",
+    "recent_tokens",
+    "older_tokens",
+    "request_tokens",
+    "reserved_output_tokens",
+    "safety_margin_tokens",
+    "summary_tokens",
+    "system_tokens",
+    "target_tokens",
     "total_tokens",
+    "used_tokens",
 }
 
 SENSITIVE_KEY_PARTS = (
@@ -162,6 +177,11 @@ def runtime_log_message(event: str, payload: dict[str, Any]) -> str:
         return f"取消请求：{_short_id(payload.get('request_id'))}"
     if event == "web_finish_request":
         return f"请求结束：{_short_id(payload.get('request_id'))}"
+    if event == "web_stream_start":
+        return (
+            f"{prefix}Web 流开始：请求 "
+            f"{_short_id(payload.get('request_id'))}"
+        )
     if event == "agent_loop_init":
         tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
         return (
@@ -192,17 +212,97 @@ def runtime_log_message(event: str, payload: dict[str, Any]) -> str:
     if event == "tool_call_start":
         return f"{prefix}调用工具：{payload.get('name', '')}"
     if event == "tool_call_result":
+        if payload.get("status") == "error":
+            detail = payload.get("error") or payload.get("error_type") or "unknown"
+            return f"{prefix}工具结束：{payload.get('name', '')} (error: {detail})"
         return f"{prefix}工具结束：{payload.get('name', '')} ({payload.get('status', '')})"
     if event == "shell_command_start":
         return f"Shell 开始：{payload.get('command', '')} @ {payload.get('cwd', '')}"
     if event == "shell_command_complete":
+        stdout_extra = _stream_log_suffix(payload, "stdout")
+        stderr_extra = _stream_log_suffix(payload, "stderr")
         return (
             f"Shell 完成：退出码 {payload.get('exit_code')}，"
-            f"stdout {payload.get('stdout_chars', 0)} 字，"
-            f"stderr {payload.get('stderr_chars', 0)} 字"
+            f"stdout {payload.get('stdout_chars', 0)} 字{stdout_extra}，"
+            f"stderr {payload.get('stderr_chars', 0)} 字{stderr_extra}"
         )
     if event == "shell_command_timeout":
-        return f"Shell 超时：{payload.get('command', '')}"
+        stdout_extra = _stream_log_suffix(payload, "stdout")
+        stderr_extra = _stream_log_suffix(payload, "stderr")
+        return (
+            f"Shell 超时：{payload.get('command', '')}，"
+            f"stdout {payload.get('stdout_chars', 0)} 字{stdout_extra}，"
+            f"stderr {payload.get('stderr_chars', 0)} 字{stderr_extra}"
+        )
+    if event == "shell_output_artifact":
+        return (
+            f"Shell 输出落盘：{payload.get('stream', '')} "
+            f"{payload.get('chars', 0)} 字 -> {payload.get('artifact_ref', '')}"
+        )
+    if event == "context_compact_check":
+        status = "超过阈值" if payload.get("over_threshold") else "未超过阈值"
+        return (
+            f"{prefix}上下文预算检查：{payload.get('request_tokens', 0)} / "
+            f"{payload.get('compact_threshold_tokens', 0)} tokens ({status})，"
+            f"输入预算 {payload.get('input_budget_tokens', 0)}"
+        )
+    if event == "context_compact_split":
+        return (
+            f"{prefix}上下文分组：旧消息 {payload.get('older_messages', 0)} 条，"
+            f"近期消息 {payload.get('recent_messages', 0)} 条，"
+            f"保留最近 {payload.get('recent_turns', 0)} 轮"
+        )
+    if event in {"context_turns_compress_start", "context_ratio_compress_start"}:
+        label = "旧对话" if event == "context_turns_compress_start" else "近期原文"
+        return (
+            f"{prefix}开始压缩{label}："
+            f"{payload.get('summary_messages', 0)} 条消息，"
+            f"目标 {payload.get('target_tokens', 0)} tokens"
+        )
+    if event in {"context_turns_compress_done", "context_ratio_compress_done"}:
+        label = "旧对话" if event == "context_turns_compress_done" else "近期原文"
+        if not payload.get("compressed"):
+            return (
+                f"{prefix}{label}压缩完成：未生成摘要，"
+                f"摘要 {payload.get('summary_chars', 0)} 字"
+            )
+        return (
+            f"{prefix}{label}压缩完成："
+            f"摘要 {payload.get('summary_chars', 0)} 字"
+        )
+    if event in {"context_turns_compress_error", "context_ratio_compress_error"}:
+        label = "旧对话" if event == "context_turns_compress_error" else "近期原文"
+        return f"{prefix}{label}压缩失败：{payload.get('error', '')}"
+    if event in {"context_turns_compress_skipped", "context_ratio_compress_skipped"}:
+        label = "旧对话" if event == "context_turns_compress_skipped" else "近期原文"
+        return (
+            f"{prefix}跳过{label}压缩：{payload.get('reason', '')}"
+        )
+    if event == "context_force_truncate_start":
+        return (
+            f"{prefix}开始强制截断上下文：{payload.get('message_count', 0)} 条消息，"
+            f"{payload.get('request_tokens', 0)} tokens"
+        )
+    if event == "context_force_truncate_done":
+        return (
+            f"{prefix}强制截断完成：{payload.get('before_messages', 0)} -> "
+            f"{payload.get('after_messages', 0)} 条，"
+            f"{payload.get('before_tokens', 0)} -> {payload.get('after_tokens', 0)} tokens"
+        )
+    if event == "context_compact_persist":
+        return (
+            f"{prefix}上下文已写回：{payload.get('before_messages', 0)} -> "
+            f"{payload.get('after_messages', 0)} 条，"
+            f"{payload.get('before_tokens', 0)} -> {payload.get('after_tokens', 0)} tokens"
+        )
+    if event == "context_budget_final":
+        status = "超出预算" if payload.get("overflow") else "通过"
+        return (
+            f"{prefix}最终上下文预算：{payload.get('used_tokens', 0)} / "
+            f"{payload.get('input_budget_tokens', 0)} tokens ({status})"
+        )
+    if event == "context_overflow":
+        return f"{prefix}上下文超预算：{payload.get('error', '')}"
     if event == "agent_run_complete":
         return (
             f"{prefix}闭环完成：第 {payload.get('round_index', 0)} 轮，"
@@ -214,10 +314,16 @@ def runtime_log_message(event: str, payload: dict[str, Any]) -> str:
     if event == "agent_run_failed":
         return f"{prefix}闭环失败"
     if event == "agent_repeated_tool_call_warning":
-        return f"{prefix}重复工具调用提醒：{payload.get('tool_name', '')}"
+        tool_call = payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
+        return f"{prefix}重复工具调用提醒：{tool_call.get('name', '')}"
     if event == "agent_repeated_tool_call_blocked":
         tool_call = payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
-        return f"{prefix}阻止重复工具调用：{tool_call.get('name', '')}"
+        return f"{prefix}跳过重复工具调用：{tool_call.get('name', '')}"
+    if event == "agent_final_answer_tool_calls_ignored":
+        return (
+            f"{prefix}最终回答模式忽略工具调用："
+            f"{payload.get('tool_count', 0)} 个"
+        )
     if event == "provider_error":
         return f"{prefix}模型请求失败：{payload.get('error', '')}"
     if event == "web_stream_usage":
@@ -292,6 +398,13 @@ def _usage_text(value: Any) -> str:
         if key in value:
             parts.append(f"{key}={value[key]}")
     return ", ".join(parts) if parts else _compact_payload(value)
+
+
+def _stream_log_suffix(payload: dict[str, Any], stream: str) -> str:
+    ref = payload.get(f"{stream}_ref")
+    if not ref:
+        return ""
+    return f"（已截断，artifact={ref}）"
 
 
 def _compact_payload(payload: dict[str, Any]) -> str:

@@ -17,7 +17,7 @@ Usage:
 """
 
 from .compression import CompressionResult, ContextCompressor, ModelContextCompressor
-from .engine import ContextEngine, ContextMessage
+from .engine import ContextEngine, ContextMessage, ContextOverflowError
 from .tokens import (
     ContextBudget,
     DEFAULT_COMPACT_THRESHOLD_RATIO,
@@ -34,6 +34,7 @@ __all__ = [
     "ContextCompressor",
     "ContextEngine",
     "ContextMessage",
+    "ContextOverflowError",
     "ModelContextCompressor",
     "DEFAULT_COMPACT_THRESHOLD_RATIO",
     "DEFAULT_CONTEXT_WINDOW_TOKENS",

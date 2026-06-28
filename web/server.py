@@ -63,6 +63,12 @@ class CancelRequest(BaseModel):
     request_id: str
 
 
+class MemoryRequest(BaseModel):
+    """Create or update long-term memory content."""
+
+    content: str = ""
+
+
 def create_app(session: WebSession | None = None) -> FastAPI:
     """Build the FastAPI app around a shared local session."""
 
@@ -146,6 +152,49 @@ def create_app(session: WebSession | None = None) -> FastAPI:
         return JSONResponse(
             {"path": str(path), "content": "", "exists": True, "error": ""}
         )
+
+    @app.get("/api/memory")
+    def read_memory() -> JSONResponse:
+        content = web_session.long_term_memory.read()
+        return JSONResponse(
+            {
+                "content": content,
+                "lineCount": len(content.splitlines()) if content else 0,
+                "error": "",
+            }
+        )
+
+    @app.put("/api/memory")
+    def replace_memory(payload: MemoryRequest) -> JSONResponse:
+        web_session.long_term_memory.write(payload.content)
+        content = web_session.long_term_memory.read()
+        return JSONResponse(
+            {
+                "content": content,
+                "lineCount": len(content.splitlines()) if content else 0,
+                "error": "",
+            }
+        )
+
+    @app.post("/api/memory/append")
+    def append_memory(payload: MemoryRequest) -> JSONResponse:
+        value = payload.content.strip()
+        if not value:
+            return JSONResponse({"error": "记忆内容不能为空。"}, status_code=400)
+        web_session.long_term_memory.append(value)
+        content = web_session.long_term_memory.read()
+        return JSONResponse(
+            {
+                "content": content,
+                "lineCount": len(content.splitlines()) if content else 0,
+                "error": "",
+            }
+        )
+
+    @app.delete("/api/memory")
+    def clear_memory() -> JSONResponse:
+        web_session.long_term_memory.clear()
+        return JSONResponse({"content": "", "lineCount": 0, "error": ""})
 
     @app.get("/api/conversations")
     def conversations(project_id: str | None = None) -> JSONResponse:

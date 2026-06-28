@@ -1,5 +1,11 @@
 import { uid } from "./utils";
 
+const CONTEXT_COMPRESSION_NOTICE_ID = "context-compression-notice";
+const CONTEXT_COMPRESSION_TEXTS = new Set([
+  "正在压缩上下文...",
+  "上下文压缩完成",
+]);
+
 export async function fetchBootstrap() {
   return requestJson("/api/bootstrap", {}, "加载运行状态失败");
 }
@@ -24,6 +30,32 @@ export async function clearRuntimeLog() {
   return requestJson("/api/logs/runtime", {
     method: "DELETE",
   }, "清空运行日志失败");
+}
+
+export async function fetchMemory() {
+  return requestJson("/api/memory", {}, "加载记忆失败");
+}
+
+export async function saveMemory(content) {
+  return requestJson("/api/memory", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  }, "保存记忆失败");
+}
+
+export async function appendMemory(content) {
+  return requestJson("/api/memory/append", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  }, "追加记忆失败");
+}
+
+export async function clearMemory() {
+  return requestJson("/api/memory", {
+    method: "DELETE",
+  }, "清空记忆失败");
 }
 
 export async function createProject(path, name = "") {
@@ -259,12 +291,28 @@ export function applyEvent(event, setMessages, setStatus) {
       );
       return;
     }
+    if (CONTEXT_COMPRESSION_TEXTS.has(event.text)) {
+      upsertContextCompressionNotice(setMessages, event.text);
+      return;
+    }
     appendNotice(setMessages, event.tone, event.text);
   }
 }
 
 function appendNotice(setMessages, tone, text) {
   setMessages((items) => [...items, { id: uid(), role: "notice", tone, text }]);
+}
+
+function upsertContextCompressionNotice(setMessages, text) {
+  setMessages((items) => [
+    ...items.filter((item) => item.id !== CONTEXT_COMPRESSION_NOTICE_ID),
+    {
+      id: CONTEXT_COMPRESSION_NOTICE_ID,
+      role: "notice",
+      tone: "context",
+      text,
+    },
+  ]);
 }
 
 function updateCurrentAssistant(items, updater) {

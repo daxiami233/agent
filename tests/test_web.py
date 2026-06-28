@@ -89,6 +89,51 @@ class ToolCallingProvider(FakeProvider):
         )
 
 
+class MultiToolCallingProvider(FakeProvider):
+    def __init__(self):
+        self.inputs = []
+        self.tools = []
+        self.calls = 0
+
+    def stream(self, input, **kwargs):
+        self.inputs.append(input)
+        self.tools.append(kwargs.get("tools"))
+        if self.calls == 0:
+            self.calls += 1
+            yield ModelStreamEvent(
+                type="finish",
+                response=ModelResponse(
+                    content=None,
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            name="weather",
+                            arguments={"location": "Shanghai"},
+                        ),
+                        ToolCall(
+                            id="call-2",
+                            name="weather",
+                            arguments={"location": "Beijing"},
+                        ),
+                    ],
+                    finish_reason="tool_calls",
+                    usage={"prompt_tokens": 12},
+                ),
+            )
+            return
+
+        self.calls += 1
+        yield ModelStreamEvent(type="content_delta", delta="done")
+        yield ModelStreamEvent(
+            type="finish",
+            response=ModelResponse(
+                content=None,
+                finish_reason="stop",
+                usage={"prompt_tokens": 20, "completion_tokens": 1},
+            ),
+        )
+
+
 class RequestedToolProvider(FakeProvider):
     def __init__(self, tool_call: ToolCall):
         self.inputs = []
@@ -176,6 +221,24 @@ def test_web_session_uses_configured_memory_store_as_sdk_component(tmp_path):
 
     assert session.memory_store.path == store.path
     assert session.agent.memory_store.path == store.path
+
+
+def test_web_session_passes_env_context_config_to_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_RUNTIME_DATA_DIR", str(tmp_path / "runtime-data"))
+    monkeypatch.setenv("RECENT_TURNS", "2")
+    monkeypatch.setenv("COMPACT_THRESHOLD_RATIO", "0.5")
+    monkeypatch.setenv("RESERVED_OUTPUT_TOKENS", "100")
+    monkeypatch.setenv("CONTEXT_SAFETY_MARGIN", "50")
+    monkeypatch.setenv("RAW_KEEP_RATIO", "0.4")
+
+    session = make_session(tmp_path)
+
+    assert session.context.context_window_tokens == 128000
+    assert session.context.recent_turns == 2
+    assert session.context.raw_keep_ratio == 0.4
+    assert session.context.compact_threshold_ratio == 0.5
+    assert session.context.reserved_output_tokens == 100
+    assert session.context.safety_margin_tokens == 50
 
 
 def test_web_session_streams_model_events(tmp_path):
@@ -439,6 +502,47 @@ def test_fastapi_runtime_logs_clear_endpoint_truncates_log(tmp_path, monkeypatch
     assert log_path.read_text(encoding="utf-8") == ""
 
 
+def test_fastapi_memory_endpoints_manage_long_term_memory(tmp_path):
+    memory = LongTermMemory()
+    memory.append("user likes tea")
+    session = WebSession(
+        provider_factory=lambda: FakeProvider(),
+        memory_store=MemoryStore(tmp_path / "memory.sqlite3"),
+        long_term_memory=memory,
+        project_store=WebProjectStore(tmp_path / "web_projects.sqlite3"),
+    )
+    client = TestClient(create_app(session=session))
+
+    read = client.get("/api/memory")
+    assert read.status_code == 200
+    assert read.json()["content"] == "user likes tea"
+    assert read.json()["lineCount"] == 1
+
+    appended = client.post("/api/memory/append", json={"content": "answer in Chinese"})
+    assert appended.status_code == 200
+    assert appended.json()["content"] == "user likes tea\nanswer in Chinese"
+
+    replaced = client.put("/api/memory", json={"content": "keep responses concise"})
+    assert replaced.status_code == 200
+    assert replaced.json()["content"] == "keep responses concise"
+    assert memory.read() == "keep responses concise"
+
+    cleared = client.delete("/api/memory")
+    assert cleared.status_code == 200
+    assert cleared.json() == {"content": "", "lineCount": 0, "error": ""}
+    assert memory.read() == ""
+
+
+def test_fastapi_memory_append_rejects_empty_content(tmp_path):
+    session = make_session(tmp_path)
+    client = TestClient(create_app(session=session))
+
+    response = client.post("/api/memory/append", json={"content": "   "})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "记忆内容不能为空。"
+
+
 def test_fastapi_cancel_marks_request_cancelled(tmp_path):
     session = make_session(tmp_path)
     client = TestClient(create_app(session=session))
@@ -516,6 +620,7 @@ def test_web_session_executes_model_requested_tools(tmp_path):
         "reasoning_delta",
         "tool_call_start",
         "tool_call_result",
+        "status",
         "assistant_start",
         "assistant_delta",
         "status",
@@ -523,6 +628,7 @@ def test_web_session_executes_model_requested_tools(tmp_path):
     assert "weather" in {tool["function"]["name"] for tool in provider.tools[0]}
     assert events[2].payload["name"] == "weather"
     assert events[3].payload["status"] == "completed"
+    assert events[4].payload["context"].startswith("输入上下文：")
     assert provider.inputs[1][0]["role"] == "system"
     assert any(
         item["role"] == "assistant"
@@ -540,6 +646,49 @@ def test_web_session_executes_model_requested_tools(tmp_path):
         "role": "assistant",
         "content": "上海现在晴，25℃。",
     }
+
+
+def test_web_session_status_refresh_does_not_repair_partial_tool_group(tmp_path):
+    provider = MultiToolCallingProvider()
+    session = make_session(
+        tmp_path,
+        provider=provider,
+        tool_registry=weather_registry(
+            handler=lambda arguments: {
+                "location": arguments["location"],
+                "temperature_c": 25,
+            }
+        ),
+    )
+
+    stream = session.submit("conversation-1", "查两个城市天气")
+    seen_status_after_first_tool = False
+    previous_type = ""
+    for event in stream:
+        if event.type == "status" and previous_type == "tool_call_result":
+            seen_status_after_first_tool = True
+            assert [
+                message.role
+                for message in session.memory_store.list_messages("conversation-1")
+            ] == ["user", "assistant", "tool"]
+            break
+        previous_type = event.type
+
+    assert seen_status_after_first_tool is True
+    list(stream)
+
+    assert any(
+        item["role"] == "tool" and item.get("tool_call_id") == "call-1"
+        for item in provider.inputs[1]
+    )
+    assert any(
+        item["role"] == "tool" and item.get("tool_call_id") == "call-2"
+        for item in provider.inputs[1]
+    )
+    assert [
+        message.role
+        for message in session.memory_store.list_messages("conversation-1")
+    ] == ["user", "assistant", "tool", "tool", "assistant"]
 
 
 def test_web_session_records_tool_errors_in_context(tmp_path):

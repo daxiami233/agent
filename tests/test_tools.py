@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -247,6 +249,60 @@ def test_shell_command_tool_executes_command(tmp_path):
     assert result["stderr"] == ""
     assert result["timed_out"] is False
     assert result["cwd"] == str(tmp_path)
+
+
+def test_shell_command_tool_writes_large_output_to_artifact(tmp_path):
+    long_text = "0123456789" * 30
+    registry = ToolRegistry(
+        [
+            shell_command_tool(
+                default_cwd=tmp_path,
+                max_output_chars=120,
+                artifact_dir=tmp_path / "artifacts",
+            )
+        ]
+    )
+
+    result = registry.execute("shell_command", {"command": f"printf '{long_text}'"})
+
+    assert result["exit_code"] == 0
+    assert result["stdout_truncated"] is True
+    assert result["stdout_ref"]
+    assert Path(result["stdout_ref"]).read_text(encoding="utf-8") == long_text
+    assert "[output truncated: 300 chars total;" in result["stdout"]
+    assert result["stdout_summary"] == "stdout: 300 chars, 1 lines"
+    assert result["stdout_chars"] == 300
+    assert result["stderr_ref"] is None
+    assert result["stderr_summary"] == "stderr: empty"
+
+
+def test_shell_command_tool_logs_large_output_artifact(tmp_path, monkeypatch):
+    log_file = tmp_path / "runtime.jsonl"
+    monkeypatch.setenv("AGENT_RUNTIME_LOG_FILE", str(log_file))
+    long_text = "x" * 300
+    registry = ToolRegistry(
+        [
+            shell_command_tool(
+                default_cwd=tmp_path,
+                max_output_chars=120,
+                artifact_dir=tmp_path / "artifacts",
+            )
+        ]
+    )
+
+    result = registry.execute("shell_command", {"command": f"printf '{long_text}'"})
+
+    records = [
+        json.loads(line)
+        for line in log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    artifact_records = [
+        record for record in records if record["event"] == "shell_output_artifact"
+    ]
+    assert artifact_records
+    assert artifact_records[0]["payload"]["stream"] == "stdout"
+    assert artifact_records[0]["payload"]["chars"] == 300
+    assert artifact_records[0]["payload"]["artifact_ref"] == result["stdout_ref"]
 
 
 def test_shell_command_tool_reports_timeout(tmp_path):

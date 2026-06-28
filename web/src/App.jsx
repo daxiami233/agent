@@ -4,12 +4,14 @@ import {
   clearRuntimeLog as clearRemoteRuntimeLog,
   fetchBootstrap,
   fetchCommands,
+  fetchMemory,
   fetchProjects,
   fetchRuntimeLog,
   createConversation as createRemoteConversation,
   deleteConversation as deleteRemoteConversation,
   deleteProject as deleteRemoteProject,
   pickProject as pickRemoteProject,
+  saveMemory as saveRemoteMemory,
   selectProject as selectRemoteProject,
   sendChat,
   cancelGeneration,
@@ -200,6 +202,70 @@ function RuntimeLogModal({ log, loading, error, onRefresh, onClear, onClose }) {
   );
 }
 
+function MemoryModal({
+  memory,
+  draft,
+  loading,
+  error,
+  notice,
+  onDraftChange,
+  onSave,
+  onClose,
+}) {
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="modalBackdrop logModalBackdrop" role="presentation">
+      <section
+        className="runtimeLogDialog memoryDialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="memory-title"
+      >
+        <header>
+          <div>
+            <h2 id="memory-title">长期记忆</h2>
+            <p>{memory.lineCount ? `${memory.lineCount} 行记忆` : "暂无记忆"}</p>
+          </div>
+          <div className="runtimeLogActions">
+            <button
+              type="button"
+              className="primary"
+              onClick={onSave}
+              disabled={loading}
+            >
+              保存
+            </button>
+            <button type="button" onClick={onClose}>关闭</button>
+          </div>
+        </header>
+        {notice && <div className="runtimeLogNotice">{notice}</div>}
+        {error && <div className="runtimeLogError">{error}</div>}
+        <div className="memoryBody">
+          <label className="memoryEditor">
+            <span className="memoryLabel">当前记忆</span>
+            <textarea
+              value={draft}
+              onChange={(event) => onDraftChange(event.target.value)}
+              placeholder="每行一条长期记忆。保存会替换当前全部记忆。"
+              spellCheck={false}
+            />
+          </label>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function TypingIndicator() {
   return (
     <div className="typing" role="status" aria-live="polite">
@@ -234,7 +300,6 @@ function ProjectChooser({
               key={project.id}
               onClick={() => onSelect(project.id)}
             >
-              <span className="projectIcon" aria-hidden="true">□</span>
               <span className="projectName">{project.name}</span>
               <span className="projectPath">{project.path}</span>
             </button>
@@ -308,6 +373,17 @@ export default function App() {
   });
   const [runtimeLogLoading, setRuntimeLogLoading] = useState(false);
   const [runtimeLogError, setRuntimeLogError] = useState("");
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
+  const [memoryState, setMemoryState] = useState({
+    content: "",
+    lineCount: 0,
+  });
+  const [memoryDraft, setMemoryDraft] = useState("");
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryError, setMemoryError] = useState("");
+  const [memoryNotice, setMemoryNotice] = useState("");
+  const [memorySaveNoticeOpen, setMemorySaveNoticeOpen] = useState(false);
+  const [memoryCloseConfirmOpen, setMemoryCloseConfirmOpen] = useState(false);
   const transcriptRef = useRef(null);
   const textareaRef = useRef(null);
   const controllersRef = useRef(new Map());
@@ -825,6 +901,72 @@ export default function App() {
     }
   }
 
+  async function openMemory() {
+    setMemoryModalOpen(true);
+    setMemoryNotice("");
+    setMemorySaveNoticeOpen(false);
+    setMemoryCloseConfirmOpen(false);
+    await refreshMemory();
+  }
+
+  function applyMemoryPayload(payload) {
+    const content = payload.content || "";
+    setMemoryState({
+      content,
+      lineCount: Number(payload.lineCount ?? (content ? content.split(/\r?\n/).length : 0)),
+    });
+    setMemoryDraft(content);
+    if (payload.error) setMemoryError(payload.error);
+  }
+
+  async function refreshMemory() {
+    setMemoryLoading(true);
+    setMemoryError("");
+    setMemoryNotice("");
+    try {
+      applyMemoryPayload(await fetchMemory());
+    } catch (err) {
+      setMemoryError(String(err));
+    } finally {
+      setMemoryLoading(false);
+    }
+  }
+
+  async function saveMemory({ showNotice = true } = {}) {
+    setMemoryLoading(true);
+    setMemoryError("");
+    setMemoryNotice("");
+    try {
+      applyMemoryPayload(await saveRemoteMemory(memoryDraft));
+      setMemoryNotice("记忆已保存。");
+      if (showNotice) setMemorySaveNoticeOpen(true);
+      return true;
+    } catch (err) {
+      setMemoryError(String(err));
+      return false;
+    } finally {
+      setMemoryLoading(false);
+    }
+  }
+
+  function closeMemory() {
+    if (memoryDraft !== memoryState.content) {
+      setMemoryCloseConfirmOpen(true);
+      return;
+    }
+    setMemoryModalOpen(false);
+    setMemoryNotice("");
+    setMemoryError("");
+  }
+
+  function discardMemoryChanges() {
+    setMemoryDraft(memoryState.content);
+    setMemoryCloseConfirmOpen(false);
+    setMemoryModalOpen(false);
+    setMemoryNotice("");
+    setMemoryError("");
+  }
+
   return (
     <main className="shell">
       <aside className="sidebar">
@@ -991,15 +1133,26 @@ export default function App() {
         </section>
         )}
       </section>
-      <button
-        type="button"
-        className="runtimeLogButton"
-        onClick={openRuntimeLog}
-        title="查看运行日志"
-        aria-label="查看运行日志"
-      >
-        日志
-      </button>
+      <div className="sideUtilityButtons">
+        <button
+          type="button"
+          className="runtimeLogButton"
+          onClick={openRuntimeLog}
+          title="查看运行日志"
+          aria-label="查看运行日志"
+        >
+          日志
+        </button>
+        <button
+          type="button"
+          className="runtimeLogButton"
+          onClick={openMemory}
+          title="查看和管理长期记忆"
+          aria-label="查看和管理长期记忆"
+        >
+          记忆
+        </button>
+      </div>
       {logModalOpen && (
         <RuntimeLogModal
           log={runtimeLog}
@@ -1009,6 +1162,73 @@ export default function App() {
           onClear={clearRuntimeLog}
           onClose={() => setLogModalOpen(false)}
         />
+      )}
+      {memoryModalOpen && (
+        <MemoryModal
+          memory={memoryState}
+          draft={memoryDraft}
+          loading={memoryLoading}
+          error={memoryError}
+          notice={memoryNotice}
+          onDraftChange={setMemoryDraft}
+          onSave={saveMemory}
+          onClose={closeMemory}
+        />
+      )}
+      {memoryCloseConfirmOpen && (
+        <div className="modalBackdrop confirmOverlay" role="presentation">
+          <section
+            className="confirmDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="memory-close-dialog-title"
+          >
+            <h2 id="memory-close-dialog-title">保存记忆修改？</h2>
+            <p>当前记忆有未保存修改，关闭后会丢失这些内容。</p>
+            <div className="confirmActions">
+              <button type="button" onClick={() => setMemoryCloseConfirmOpen(false)}>
+                继续编辑
+              </button>
+              <button type="button" onClick={discardMemoryChanges}>
+                不保存
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={async () => {
+                  if (await saveMemory({ showNotice: false })) {
+                    setMemoryCloseConfirmOpen(false);
+                    setMemoryModalOpen(false);
+                  }
+                }}
+              >
+                保存并关闭
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {memorySaveNoticeOpen && (
+        <div className="modalBackdrop confirmOverlay" role="presentation">
+          <section
+            className="confirmDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="memory-save-dialog-title"
+          >
+            <h2 id="memory-save-dialog-title">保存成功</h2>
+            <p>长期记忆已保存。</p>
+            <div className="confirmActions">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => setMemorySaveNoticeOpen(false)}
+              >
+                知道了
+              </button>
+            </div>
+          </section>
+        </div>
       )}
       {deleteTarget && (
         <div className="modalBackdrop" role="presentation">
