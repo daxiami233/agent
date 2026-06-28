@@ -40,12 +40,7 @@ Never commit a real `.env` file. Use `.env.example` as the template.
 ```bash
 git clone <repo-url>
 cd agent
-
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev,tokenizers]"
-
-cp .env.example .env
+./scripts/setup.sh
 ```
 
 Edit `.env` and set at least:
@@ -59,7 +54,7 @@ MODEL=your-model-name
 Start the local web app:
 
 ```bash
-agent --host 127.0.0.1 --port 8765
+./scripts/run.sh
 ```
 
 Then open:
@@ -67,6 +62,33 @@ Then open:
 ```text
 http://127.0.0.1:8765
 ```
+
+After `.env` is configured, you can also install and run in one command:
+
+```bash
+./scripts/dev.sh
+```
+
+Manual setup is also available:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,tokenizers]"
+cp .env.example .env
+python -m web.main --host 127.0.0.1 --port 8765
+```
+
+## Scripts
+
+| Command | Purpose |
+|---|---|
+| `./scripts/setup.sh` | Create `.venv`, install Python dependencies, install/build the web UI when `npm` is available, and create `.env` if missing. |
+| `./scripts/run.sh` | Start the local web server from `.venv`. |
+| `./scripts/dev.sh` | Run setup and then start the server. |
+
+`HOST`, `PORT`, `PYTHON`, and `VENV_DIR` can be overridden through environment
+variables.
 
 ## Rebuilding the Web UI
 
