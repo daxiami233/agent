@@ -137,6 +137,8 @@ def apply_patch_tool(
         },
         handler=handle,
         capabilities=["file", "write"],
+        risk_level="confirm",
+        effects=["write"],
     )
 
 

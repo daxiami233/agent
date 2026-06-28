@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from agent_runtime import PermissionProfile
 from agent_runtime.logging import format_runtime_log_content, runtime_log_path
 
 from .session import WebEvent, WebSession
@@ -34,6 +35,10 @@ class ChatRequest(BaseModel):
     message: str = ""
     request_id: str
     reasoning_enabled: bool = True
+    permission_profile: PermissionProfile | None = None
+    permission_approved: bool = False
+    permission_denied: bool = False
+    permission_id: str = ""
 
 
 class ConversationRequest(BaseModel):
@@ -266,6 +271,10 @@ def create_app(session: WebSession | None = None) -> FastAPI:
                 payload.message,
                 request_id=payload.request_id,
                 reasoning_enabled=payload.reasoning_enabled,
+                permission_profile=payload.permission_profile,
+                permission_approved=payload.permission_approved,
+                permission_denied=payload.permission_denied,
+                permission_id=payload.permission_id,
             ),
             session=web_session,
             request_id=payload.request_id,

@@ -1,7 +1,24 @@
-"""Permission and approval primitives for Agent Runtime.
+"""Tool permission primitives for Agent Runtime."""
 
-This package is reserved for tool risk levels, human confirmation, approval
-flows, and future policy checks.
-"""
+from .manager import PermissionManager
+from .policy import DefaultPermissionPolicy, PermissionPolicyProtocol
+from .types import (
+    Effect,
+    PermissionAction,
+    PermissionDecision,
+    PermissionProfile,
+    PermissionRequest,
+    RiskLevel,
+)
 
-__all__: list[str] = []
+__all__ = [
+    "DefaultPermissionPolicy",
+    "Effect",
+    "PermissionAction",
+    "PermissionDecision",
+    "PermissionManager",
+    "PermissionPolicyProtocol",
+    "PermissionProfile",
+    "PermissionRequest",
+    "RiskLevel",
+]

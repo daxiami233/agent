@@ -128,6 +128,8 @@ def test_root_package_exports_common_sdk_types():
     assert agent_runtime.ToolSpec is ToolSpec
     assert agent_runtime.SkillManifest is SkillManifest
     assert agent_runtime.Provider is not None
+    assert agent_runtime.PermissionPolicyProtocol is not None
+    assert agent_runtime.PermissionRequest is not None
     assert callable(agent_runtime.tool)
 
 
@@ -297,6 +299,21 @@ def test_create_agent_passes_provider_timeout_to_agent_loop(tmp_path):
     )
 
     assert agent.loop.model_timeout_seconds == 12
+
+
+def test_create_agent_includes_working_directory_in_system_prompt(tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    agent = create_agent(
+        config=AgentRuntimeConfig(data_dir=tmp_path),
+        provider=StreamingProvider(),
+        working_directory=project_dir,
+        log_context=lambda _conversation_id, _model_input: None,
+    )
+
+    assert "# Current Workspace" in agent.context.system_prompt
+    assert f"Current working directory: {project_dir.resolve()}" in agent.context.system_prompt
 
 
 def test_create_agent_registers_optional_runtime_tools(tmp_path):

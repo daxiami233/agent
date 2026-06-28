@@ -95,6 +95,7 @@ function ToolCard({ tool, streamComplete }) {
   const status = tool.status ?? "running";
   const isRunning = status === "running";
   const isError = status === "error";
+  const isDenied = status === "denied";
   const isActive = isRunning && !streamComplete;
   return (
     <details
@@ -109,7 +110,7 @@ function ToolCard({ tool, streamComplete }) {
         </span>
         <span className="toolStatus">
           {isRunning && <span className="spinner" aria-hidden="true" />}
-          {isRunning ? "调用中" : isError ? "失败" : "完成"}
+          {isRunning ? "调用中" : isError ? "失败" : isDenied ? "拒绝" : "完成"}
         </span>
       </summary>
       {!isRunning && (

@@ -35,6 +35,7 @@ def memory_read_tool(memory: LongTermMemoryProtocol) -> ToolSpec:
         },
         handler=handle,
         capabilities=["memory"],
+        effects=["read"],
     )
 
 
@@ -70,6 +71,7 @@ def memory_search_tool(memory: LongTermMemoryProtocol) -> ToolSpec:
         },
         handler=handle,
         capabilities=["memory"],
+        effects=["read"],
     )
 
 
@@ -102,6 +104,7 @@ def memory_append_tool(memory: LongTermMemoryProtocol) -> ToolSpec:
         },
         handler=handle,
         capabilities=["memory"],
+        effects=["write"],
     )
 
 
@@ -135,4 +138,5 @@ def memory_replace_tool(memory: LongTermMemoryProtocol) -> ToolSpec:
         },
         handler=handle,
         capabilities=["memory"],
+        effects=["write"],
     )

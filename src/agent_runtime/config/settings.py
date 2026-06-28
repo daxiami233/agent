@@ -26,6 +26,7 @@ DEFAULT_SHELL_TIMEOUT_SECONDS = 30
 DEFAULT_SHELL_MAX_OUTPUT_CHARS = 20_000
 
 MemoryBackend = Literal["sqlite", "memory"]
+ToolPermissionProfile = Literal["read_only", "workspace", "full_access"]
 
 
 @dataclass(slots=True)
@@ -53,6 +54,7 @@ class AgentRuntimeConfig:
             process-local storage.
         long_term_memory_max_lines: Lines injected from long-term memory.
         include_*_tool: Whether to register built-in local tool groups.
+        tool_permission_profile: Default permission policy profile for tool calls.
         shell_*: Limits for the local shell tool.
         skill_paths: Directories scanned for ``SKILL.md`` manifests.
         skill_resource_max_bytes: Maximum bytes returned by skill resource tools.
@@ -136,6 +138,9 @@ class AgentRuntimeConfig:
     # Whether to register the local patch application tool by default.
     include_apply_patch_tool: bool = True
 
+    # Default permission profile for built-in tools.
+    tool_permission_profile: ToolPermissionProfile = "workspace"
+
     # Skill directories. In .env, multiple paths use the OS path separator.
     skill_paths: list[str] = field(default_factory=list)
 
@@ -172,6 +177,11 @@ class AgentRuntimeConfig:
         self.shell_timeout_seconds = max(1, int(self.shell_timeout_seconds))
         self.shell_max_output_chars = max(1, int(self.shell_max_output_chars))
         self.skill_resource_max_bytes = max(1, int(self.skill_resource_max_bytes))
+        if self.tool_permission_profile not in {"read_only", "workspace", "full_access"}:
+            raise ValueError(
+                'Invalid tool_permission_profile. Must be "read_only", '
+                '"workspace", or "full_access".'
+            )
 
     @classmethod
     def from_env(cls) -> "AgentRuntimeConfig":
@@ -218,6 +228,10 @@ class AgentRuntimeConfig:
             include_skill_tools=_env_bool("ENABLE_SKILL_TOOLS", True),
             include_shell_tool=_env_bool("ENABLE_SHELL_TOOL", True),
             include_apply_patch_tool=_env_bool("ENABLE_APPLY_PATCH_TOOL", True),
+            tool_permission_profile=_env_permission_profile(
+                "TOOL_PERMISSION_PROFILE",
+                "workspace",
+            ),
             skill_paths=_env_list("SKILL_PATHS"),
             shell_timeout_seconds=_env_int(
                 "SHELL_TIMEOUT_SECONDS",
@@ -235,6 +249,13 @@ class AgentRuntimeConfig:
 
 
 RuntimeSettings = AgentRuntimeConfig
+
+
+def _env_permission_profile(name: str, default: ToolPermissionProfile) -> ToolPermissionProfile:
+    value = os.getenv(name)
+    if value in {"read_only", "workspace", "full_access"}:
+        return value
+    return default
 
 
 def _env_int(name: str, default: int) -> int:

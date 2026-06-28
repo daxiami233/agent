@@ -173,3 +173,79 @@ def test_format_runtime_log_content_renders_tool_error_detail():
     content = format_runtime_log_content(raw)
 
     assert "工具结束：shell_command (error: Command blocked)" in content
+
+
+def test_format_runtime_log_content_renders_permission_decision():
+    raw = (
+        '{"ts":"2026-06-26T16:30:52+0800","event":"tool_permission_decision",'
+        '"payload":{"conversation_id":"conversation-1","name":"apply_patch",'
+        '"action":"confirm","risk_level":"confirm","effects":["write"],'
+        '"reason":"Tool requires confirmation."}}\n'
+    )
+
+    content = format_runtime_log_content(raw)
+
+    assert "权限判定：apply_patch -> 需要确认" in content
+    assert "风险 confirm，影响 write" in content
+    assert "原因：Tool requires confirmation." in content
+
+
+def test_format_runtime_log_content_renders_permission_required_and_denied():
+    raw = (
+        '{"ts":"2026-06-26T16:30:52+0800","event":"tool_permission_required",'
+        '"payload":{"conversation_id":"conversation-1","tool_name":"shell_command",'
+        '"risk_level":"auto","effects":["execute"],'
+        '"reason":"Shell command requires confirmation."}}\n'
+        '{"ts":"2026-06-26T16:30:53+0800","event":"tool_permission_denied",'
+        '"payload":{"conversation_id":"conversation-1","tool_name":"shell_command",'
+        '"reason":"Shell command is blocked by policy."}}\n'
+    )
+
+    content = format_runtime_log_content(raw)
+
+    assert "工具需要权限确认：shell_command，风险 auto，影响 execute" in content
+    assert "工具权限拒绝：shell_command，原因：Shell command is blocked by policy." in content
+
+
+def test_format_runtime_log_content_renders_permission_approved_submit():
+    raw = (
+        '{"ts":"2026-06-26T16:30:52+0800","event":"web_submit",'
+        '"payload":{"conversation_id":"conversation-1","text_preview":"delete file",'
+        '"permission_profile":"full_access","permission_approved":true}}\n'
+    )
+
+    content = format_runtime_log_content(raw)
+
+    assert "用户输入：delete file，权限确认已通过 (full_access)" in content
+
+
+def test_format_runtime_log_content_renders_permission_resume_and_user_denied():
+    raw = (
+        '{"ts":"2026-06-26T16:30:52+0800","event":"tool_permission_resume",'
+        '"payload":{"conversation_id":"conversation-1","approved":false,'
+        '"tool_count":1}}\n'
+        '{"ts":"2026-06-26T16:30:52+0800","event":"tool_call_result",'
+        '"payload":{"conversation_id":"conversation-1","name":"shell_command",'
+        '"status":"denied"}}\n'
+        '{"ts":"2026-06-26T16:30:53+0800","event":"tool_permission_user_denied",'
+        '"payload":{"conversation_id":"conversation-1","name":"shell_command"}}\n'
+    )
+
+    content = format_runtime_log_content(raw)
+
+    assert "权限恢复：拒绝，工具 1 个" in content
+    assert "工具结束：shell_command (denied)" in content
+    assert "用户拒绝工具调用：shell_command" in content
+
+
+def test_format_runtime_log_content_renders_permission_resume_direct_answer():
+    raw = (
+        '{"ts":"2026-06-26T16:30:52+0800",'
+        '"event":"tool_permission_resume_direct_answer",'
+        '"payload":{"conversation_id":"conversation-1",'
+        '"answer_preview":"操作已完成。"}}\n'
+    )
+
+    content = format_runtime_log_content(raw)
+
+    assert "权限恢复后直接回复：操作已完成。" in content

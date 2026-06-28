@@ -100,7 +100,15 @@ export async function deleteProject(projectId) {
   }, "移除项目失败");
 }
 
-export async function sendChat(conversationId, message, requestId, reasoningEnabled, controller, onEvent) {
+export async function sendChat(
+  conversationId,
+  message,
+  requestId,
+  reasoningEnabled,
+  controller,
+  onEvent,
+  options = {},
+) {
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -109,6 +117,10 @@ export async function sendChat(conversationId, message, requestId, reasoningEnab
       message,
       request_id: requestId,
       reasoning_enabled: reasoningEnabled,
+      permission_profile: options.permissionProfile ?? null,
+      permission_approved: Boolean(options.permissionApproved),
+      permission_denied: Boolean(options.permissionDenied),
+      permission_id: options.permissionId ?? "",
     }),
     signal: controller.signal,
   });
@@ -289,6 +301,21 @@ export function applyEvent(event, setMessages, setStatus) {
           }),
         ),
       );
+      return;
+    }
+    if (event.text === "已拒绝工具调用。") {
+      setMessages((items) => {
+        const last = items[items.length - 1];
+        if (last?.role !== "assistant") return items;
+        const hasDeniedTool = (last.steps ?? []).some(
+          (step) => step.type === "tool" && step.status === "denied",
+        );
+        if (!hasDeniedTool) return items;
+        return [
+          ...items.slice(0, -1),
+          finalizeAssistantMessage(last),
+        ];
+      });
       return;
     }
     if (CONTEXT_COMPRESSION_TEXTS.has(event.text)) {

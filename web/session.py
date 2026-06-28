@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from agent_runtime import Agent, AgentRuntimeConfig, create_agent
+from agent_runtime import Agent, AgentRuntimeConfig, PermissionProfile, create_agent
 from agent_runtime.mcp import MCPClientHost
 from agent_runtime.memory import LongTermMemory, MemoryStore
 from agent_runtime.providers import OpenAIProvider, ProviderError
@@ -239,13 +239,20 @@ class WebSession:
         self.memory_store = memory_store or MemoryStore()
         self.long_term_memory = long_term_memory or LongTermMemory()
         self.context = None
-        self.tool_registry = tool_registry or ToolRegistry()
-        self.skill_registry = skill_registry or SkillRegistry(skills or [])
+        custom_tool_registry = tool_registry or ToolRegistry()
+        self._custom_tools = custom_tool_registry.list()
+        self.tool_registry = custom_tool_registry
+        self._custom_skills = skill_registry.list() if skill_registry is not None else list(skills or [])
+        self.skill_registry = skill_registry or SkillRegistry(self._custom_skills)
         self.mcp_host = mcp_host or MCPClientHost()
+        self._include_memory_tools = include_memory_tools
+        self._include_skill_tools = include_skill_tools
+        self._include_shell_tool = include_shell_tool
+        self._include_apply_patch_tool = include_apply_patch_tool
         self.project_store = project_store or WebProjectStore(
             self._default_project_store_path(self.memory_store)
         )
-        self.default_project = self.project_store.ensure_project(Path.cwd())
+        self.active_project: ProjectRecord | None = None
         self.agent: Agent | None = None
         self.commands = self._build_commands()
         self.should_shutdown = False
@@ -258,48 +265,12 @@ class WebSession:
                     "include_skill_tools": include_skill_tools,
                     "include_shell_tool": include_shell_tool,
                     "include_apply_patch_tool": include_apply_patch_tool,
-                    "default_project": self.default_project.path,
+                    "startup_directory": str(Path.cwd()),
                 },
         )
         try:
             self.provider = self.provider_factory()
-            runtime_config = AgentRuntimeConfig.from_env()
-            provider_context_window = getattr(self.provider, "context_window_tokens", None)
-            if provider_context_window:
-                runtime_config = replace(
-                    runtime_config,
-                    context_window_tokens=int(provider_context_window),
-                )
-            runtime_config = replace(
-                runtime_config,
-                include_memory_tools=include_memory_tools,
-                include_skill_tools=include_skill_tools,
-                include_shell_tool=include_shell_tool,
-                include_apply_patch_tool=include_apply_patch_tool,
-            )
-            self.agent = create_agent(
-                config=runtime_config,
-                provider=self.provider,
-                tools=self.tool_registry.list(),
-                skills=self.skill_registry.list(),
-                memory_store=self.memory_store,
-                long_term_memory=self.long_term_memory,
-            )
-            self.context = self.agent.context
-            self.memory_store = self.agent.memory_store
-            self.tool_registry = self.agent.tool_registry
-            self.skill_registry = self.agent.skill_registry
-            self.mcp_host = self.agent.mcp_host
-            self.long_term_memory = self.context.long_term_memory
-            runtime_log(
-                "web_session_agent_ready",
-                {
-                    "provider": self.provider.__class__.__name__,
-                    "model": getattr(self.provider, "model", ""),
-                    "tools": [tool.name for tool in self.tool_registry.list()],
-                    "log_file": str(runtime_log_path()),
-                },
-            )
+            self._configure_agent_for_working_directory(Path.cwd())
         except ProviderError as exc:
             runtime_log(
                 "web_session_provider_error",
@@ -308,23 +279,62 @@ class WebSession:
             self._append_error(str(exc))
             self._append_hint("请在 .env 中设置 API_KEY、BASE_URL 和 MODEL。")
 
+    def _configure_agent_for_working_directory(
+        self,
+        working_directory: Path | str,
+        project: ProjectRecord | None = None,
+    ) -> None:
+        if self.provider is None:
+            return
+        working_path = str(Path(working_directory).expanduser().resolve())
+        runtime_config = AgentRuntimeConfig.from_env()
+        provider_context_window = getattr(self.provider, "context_window_tokens", None)
+        if provider_context_window:
+            runtime_config = replace(
+                runtime_config,
+                context_window_tokens=int(provider_context_window),
+            )
+        runtime_config = replace(
+            runtime_config,
+            include_memory_tools=self._include_memory_tools,
+            include_skill_tools=self._include_skill_tools,
+            include_shell_tool=self._include_shell_tool,
+            include_apply_patch_tool=self._include_apply_patch_tool,
+        )
+        self.agent = create_agent(
+            config=runtime_config,
+            provider=self.provider,
+            tools=self._custom_tools,
+            skills=self._custom_skills,
+            memory_store=self.memory_store,
+            long_term_memory=self.long_term_memory,
+            working_directory=working_path,
+        )
+        self.context = self.agent.context
+        self.memory_store = self.agent.memory_store
+        self.tool_registry = self.agent.tool_registry
+        self.skill_registry = self.agent.skill_registry
+        self.mcp_host = self.agent.mcp_host
+        self.long_term_memory = self.context.long_term_memory
+        if project is not None:
+            self.active_project = project
+        runtime_log(
+            "web_session_agent_ready",
+            {
+                "provider": self.provider.__class__.__name__,
+                "model": getattr(self.provider, "model", ""),
+                "tools": [tool.name for tool in self.tool_registry.list()],
+                "working_directory": working_path,
+                "log_file": str(runtime_log_path()),
+            },
+        )
+
+    def _configure_agent_for_project(self, project: ProjectRecord) -> None:
+        self._configure_agent_for_working_directory(project.path, project=project)
+
     def boot_events(self) -> list[WebEvent]:
         return [
-            WebEvent(
-                "status",
-                {
-                    "cwd": Path.cwd().name or str(Path.cwd()),
-                    "cwdPath": str(Path.cwd()),
-                    "logFile": str(runtime_log_path()),
-                    "model": self._model_display_text(),
-                    **self._context_window_payload(),
-                    "apiMode": (
-                        self.provider.current_api_mode()
-                        if self.provider is not None
-                        else "未配置"
-                    ),
-                },
-            ),
+            WebEvent("status", self._status_payload()),
             *self._drain_output_events(),
         ]
 
@@ -349,9 +359,11 @@ class WebSession:
             raise ValueError(f"Project not found: {project_id}")
         self.project_store.touch_project(project_id)
         project = self.project_store.get_project(project_id) or project
+        self._configure_agent_for_project(project)
         return {
             "project": self._project_payload(project),
             "conversations": self.list_conversations(project_id),
+            "status": self._status_payload(),
         }
 
     def delete_project(self, project_id: str) -> None:
@@ -392,10 +404,17 @@ class WebSession:
         text: str,
         request_id: str = "",
         reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
+        permission_approved: bool = False,
+        permission_denied: bool = False,
+        permission_id: str = "",
     ) -> Iterator[WebEvent]:
         value = text.strip()
         if not value:
             return
+        is_permission_resume = bool(
+            permission_id and (permission_approved or permission_denied)
+        )
 
         runtime_log(
             "web_submit",
@@ -404,10 +423,25 @@ class WebSession:
                 "request_id": request_id,
                 "text_preview": self._summarize_value(value),
                 "reasoning_enabled": reasoning_enabled,
+                "permission_profile": permission_profile or "",
+                "permission_approved": permission_approved,
+                "permission_denied": permission_denied,
+                "permission_id": permission_id,
             },
         )
-        self._append_history(value)
-        if value.startswith("/") or value.startswith(":"):
+        if is_permission_resume:
+            yield from self._resume_permission(
+                conversation_id,
+                request_id=request_id,
+                reasoning_enabled=reasoning_enabled,
+                permission_id=permission_id,
+                approved=permission_approved,
+            )
+            return
+
+        if not permission_approved:
+            self._append_history(value)
+        if not permission_approved and (value.startswith("/") or value.startswith(":")):
             runtime_log(
                 "web_command",
                 {
@@ -419,14 +453,64 @@ class WebSession:
             yield from self._handle_command(value)
             return
 
-        self._ensure_conversation_title(conversation_id, value)
-        yield WebEvent("user_message", {"text": value})
+        if not permission_approved:
+            self._ensure_conversation_title(conversation_id, value)
+            yield WebEvent("user_message", {"text": value})
         yield from self._stream_model(
             conversation_id,
             user_input=value,
             request_id=request_id,
             reasoning_enabled=reasoning_enabled,
+            permission_profile=permission_profile,
+            reuse_existing_user_turn=permission_approved,
         )
+
+    def _resume_permission(
+        self,
+        conversation_id: str,
+        *,
+        request_id: str,
+        reasoning_enabled: bool,
+        permission_id: str,
+        approved: bool,
+    ) -> Iterator[WebEvent]:
+        if self.agent is None:
+            self._append_error("模型服务尚未初始化。")
+            yield from self._drain_output_events()
+            return
+
+        runtime_log(
+            "web_stream_start",
+            {
+                "conversation_id": conversation_id,
+                "request_id": request_id,
+                "permission_id": permission_id,
+            },
+        )
+        is_cancelled = lambda: bool(request_id and request_id in self._cancelled_requests)
+        for event in self.agent.loop.resume_permission(
+            permission_id,
+            approved=approved,
+            reasoning_enabled=reasoning_enabled,
+            is_cancelled=is_cancelled,
+        ):
+            if event.type == "usage":
+                usage = event.payload.get("usage")
+                runtime_log(
+                    "web_stream_usage",
+                    {
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "usage": usage if isinstance(usage, dict) else {},
+                    },
+                )
+                yield WebEvent("status", self._context_window_payload(conversation_id))
+                continue
+            yield WebEvent(event.type, event.payload)
+            if event.type == "tool_call_result" or self._is_context_notice(event):
+                yield WebEvent("status", self._context_window_payload(conversation_id))
+
+        yield from self._drain_output_events()
 
     def cancel(self, request_id: str) -> None:
         if request_id:
@@ -466,6 +550,8 @@ class WebSession:
         user_input: str,
         request_id: str,
         reasoning_enabled: bool,
+        permission_profile: PermissionProfile | None,
+        reuse_existing_user_turn: bool = False,
     ) -> Iterator[WebEvent]:
         if self.agent is None:
             self._append_error("模型服务尚未初始化。")
@@ -479,12 +565,23 @@ class WebSession:
                 "request_id": request_id,
             },
         )
-        for event in self.agent.stream(
-            user_input,
-            conversation_id=conversation_id,
-            reasoning_enabled=reasoning_enabled,
-            is_cancelled=lambda: bool(request_id and request_id in self._cancelled_requests),
-        ):
+        is_cancelled = lambda: bool(request_id and request_id in self._cancelled_requests)
+        if reuse_existing_user_turn:
+            agent_events = self.agent.loop.run(
+                conversation_id,
+                reasoning_enabled=reasoning_enabled,
+                permission_profile=permission_profile,
+                is_cancelled=is_cancelled,
+            )
+        else:
+            agent_events = self.agent.stream(
+                user_input,
+                conversation_id=conversation_id,
+                reasoning_enabled=reasoning_enabled,
+                permission_profile=permission_profile,
+                is_cancelled=is_cancelled,
+            )
+        for event in agent_events:
             if event.type == "usage":
                 usage = event.payload.get("usage")
                 runtime_log(
@@ -567,7 +664,8 @@ class WebSession:
 
     def _append_status(self) -> None:
         self._append_info("状态")
-        self._append_hint(f"工作目录：{Path.cwd()}")
+        working_directory = self.active_project.path if self.active_project else "未选择项目"
+        self._append_hint(f"工作目录：{working_directory}")
         self._append_hint(f"历史记录：{self._history_path()}")
         if self.provider is None:
             self._append_hint("模型服务：未配置")
@@ -576,6 +674,21 @@ class WebSession:
                 f"模型服务：{self.provider.current_api_mode()} ({self.provider.model})"
             )
             self._append_hint(f"上下文：{self._context_window_text()}")
+
+    def _status_payload(self, conversation_id: str | None = None) -> dict[str, Any]:
+        cwd_path = self.active_project.path if self.active_project else ""
+        return {
+            "cwd": Path(cwd_path).name or cwd_path or "未选择项目",
+            "cwdPath": cwd_path,
+            "logFile": str(runtime_log_path()),
+            "model": self._model_display_text(),
+            **self._context_window_payload(conversation_id),
+            "apiMode": (
+                self.provider.current_api_mode()
+                if self.provider is not None
+                else "未配置"
+            ),
+        }
 
     def _clear_screen(self) -> None:
         self._output_events.append(WebEvent("clear", {}))

@@ -7,11 +7,13 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from agent_runtime.context import ContextEngine, ContextOverflowError
 from agent_runtime.logging import runtime_log
+from agent_runtime.permissions import PermissionManager, PermissionProfile, PermissionRequest
 from agent_runtime.providers import ModelConfig, Provider, ProviderError, ToolCall
-from agent_runtime.tools import ToolRegistry
+from agent_runtime.tools import ToolNotFoundError, ToolRegistry
 
 
 MAX_IDENTICAL_TOOL_CALLS = 2
@@ -41,6 +43,19 @@ class _ModelTurnResult:
     failed: bool = False
 
 
+@dataclass(slots=True)
+class _PendingPermission:
+    """A model-emitted tool-call batch paused for user approval."""
+
+    id: str
+    conversation_id: str
+    assistant_text: str
+    reasoning_text: str
+    steps: list[dict[str, Any]]
+    tool_calls: list[ToolCall]
+    created_at: float
+
+
 class AgentLoop:
     """Coordinates context building, model calls, tool calls, and memory writes."""
 
@@ -50,15 +65,18 @@ class AgentLoop:
         provider: Provider,
         context: ContextEngine,
         tool_registry: ToolRegistry,
+        permission_manager: PermissionManager | None = None,
         log_context: Callable[[str, list[dict[str, Any]]], None] | None = None,
         model_timeout_seconds: float = 60,
     ) -> None:
         self.provider = provider
         self.context = context
         self.tool_registry = tool_registry
+        self.permission_manager = permission_manager or PermissionManager()
         self.log_context = log_context or self._log_model_context
         self.model_timeout_seconds = model_timeout_seconds
         self._compress_events: list[str] = []
+        self._pending_permissions: dict[str, _PendingPermission] = {}
         self.context.on_compress = self._on_compress
         runtime_log(
             "agent_loop_init",
@@ -74,6 +92,7 @@ class AgentLoop:
         conversation_id: str,
         *,
         reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
         """Run the model/tool loop for one persisted conversation."""
@@ -223,6 +242,40 @@ class AgentLoop:
                                 },
                             },
                         )
+                permission_event = self._permission_interruption(
+                    conversation_id,
+                    executable_calls,
+                    round_index=round_index,
+                    permission_profile=permission_profile,
+                    assistant_text=final_assistant_text,
+                    reasoning_text="\n".join(all_reasoning_parts),
+                    steps=execution_steps,
+                )
+                if permission_event is not None:
+                    yield permission_event
+                    if permission_event.type == "permission_request":
+                        yield AgentEvent(
+                            "notice",
+                            {
+                                "tone": "muted",
+                                "text": (
+                                    "工具调用需要确认，当前核心版本已暂停执行："
+                                    f"{permission_event.payload.get('tool_name', '')}"
+                                ),
+                            },
+                        )
+                    else:
+                        yield AgentEvent(
+                            "notice",
+                            {
+                                "tone": "error",
+                                "text": (
+                                    "工具调用被权限策略拒绝："
+                                    f"{permission_event.payload.get('tool_name', '')}"
+                                ),
+                            },
+                        )
+                    return
                 self.context.add_assistant_message(
                     conversation_id,
                     final_assistant_text,
@@ -233,7 +286,10 @@ class AgentLoop:
                         for tc in executable_calls
                     ],
                 )
-                tool_steps = yield from self._execute_tool_calls(conversation_id, executable_calls)
+                tool_steps = yield from self._execute_tool_calls(
+                    conversation_id,
+                    executable_calls,
+                )
                 execution_steps.extend(tool_steps)
                 duplicate_skip_rounds = 0
                 round_index += 1
@@ -274,6 +330,7 @@ class AgentLoop:
         user_input: str,
         *,
         reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
         """Persist a user message and run the agent loop for that turn."""
@@ -293,6 +350,80 @@ class AgentLoop:
         yield from self.run(
             conversation_id,
             reasoning_enabled=reasoning_enabled,
+            permission_profile=permission_profile,
+            is_cancelled=is_cancelled,
+        )
+
+    def resume_permission(
+        self,
+        permission_id: str,
+        *,
+        approved: bool,
+        reasoning_enabled: bool = True,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Resume a paused permission request without asking the model again."""
+
+        pending = self._pending_permissions.pop(permission_id, None)
+        if pending is None:
+            runtime_log(
+                "tool_permission_resume_missing",
+                {"permission_id": permission_id},
+            )
+            yield AgentEvent(
+                "notice",
+                {
+                    "tone": "error",
+                    "text": "权限请求已失效，请重新发起操作。",
+                },
+            )
+            return
+
+        runtime_log(
+            "tool_permission_resume",
+            {
+                "conversation_id": pending.conversation_id,
+                "permission_id": permission_id,
+                "approved": approved,
+                "tool_count": len(pending.tool_calls),
+            },
+        )
+        self._persist_pending_permission(pending)
+        if not approved:
+            yield from self._deny_pending_tool_calls(pending)
+            yield AgentEvent(
+                "notice",
+                {"tone": "muted", "text": "已拒绝工具调用。"},
+            )
+            return
+
+        tool_steps = yield from self._execute_tool_calls(
+            pending.conversation_id,
+            pending.tool_calls,
+        )
+        direct_answer = self._direct_permission_resume_answer(pending, tool_steps)
+        if direct_answer:
+            self.context.add_assistant_message(
+                pending.conversation_id,
+                direct_answer,
+            )
+            yield AgentEvent("assistant_start", {})
+            yield AgentEvent("assistant_delta", {"text": direct_answer})
+            yield AgentEvent("usage", {"usage": {}})
+            runtime_log(
+                "tool_permission_resume_direct_answer",
+                {
+                    "conversation_id": pending.conversation_id,
+                    "permission_id": permission_id,
+                    "tool_count": len(pending.tool_calls),
+                    "answer_preview": self._summarize_value(direct_answer),
+                },
+            )
+            return
+        yield from self.run(
+            pending.conversation_id,
+            reasoning_enabled=reasoning_enabled,
+            permission_profile=None,
             is_cancelled=is_cancelled,
         )
 
@@ -464,13 +595,10 @@ class AgentLoop:
                 result = self.tool_registry.execute(call.name, arguments)
                 status = "completed"
             except Exception as exc:
-                result = {
-                    "error": str(exc),
-                    "type": exc.__class__.__name__,
-                }
+                result = self._tool_error_result(call, exc)
                 status = "error"
 
-            result_summary = self._summarize_value(result)
+            result_summary = self._tool_result_summary(call, status, result)
             runtime_log(
                 "tool_call_result",
                 {
@@ -514,6 +642,264 @@ class AgentLoop:
                 },
             )
         return steps
+
+    def _permission_interruption(
+        self,
+        conversation_id: str,
+        tool_calls: list[ToolCall],
+        *,
+        round_index: int,
+        permission_profile: PermissionProfile | None,
+        assistant_text: str,
+        reasoning_text: str,
+        steps: list[dict[str, Any]],
+    ) -> AgentEvent | None:
+        for call in tool_calls:
+            request = self._permission_request(
+                conversation_id,
+                call,
+                permission_profile=permission_profile,
+            )
+            decision = self.permission_manager.evaluate(request)
+            runtime_log(
+                "tool_permission_decision",
+                {
+                    "conversation_id": conversation_id,
+                    "round_index": round_index,
+                    "id": call.id,
+                    "name": call.name,
+                    "action": decision.action,
+                    "reason": decision.reason,
+                    "risk_level": request.risk_level,
+                    "effects": request.effects,
+                    "capabilities": request.capabilities,
+                },
+            )
+            if decision.action == "allow":
+                continue
+            payload = {
+                "id": call.id,
+                "tool_name": call.name,
+                "arguments": request.arguments,
+                "risk_level": request.risk_level,
+                "effects": request.effects,
+                "capabilities": request.capabilities,
+                "reason": decision.reason,
+            }
+            if decision.action == "confirm":
+                permission_id = str(uuid4())
+                self._pending_permissions[permission_id] = _PendingPermission(
+                    id=permission_id,
+                    conversation_id=conversation_id,
+                    assistant_text=assistant_text,
+                    reasoning_text=reasoning_text,
+                    steps=[dict(step) for step in steps],
+                    tool_calls=list(tool_calls),
+                    created_at=time.time(),
+                )
+                runtime_log(
+                    "tool_permission_required",
+                    {
+                        "conversation_id": conversation_id,
+                        "round_index": round_index,
+                        "permission_id": permission_id,
+                        **payload,
+                    },
+                )
+                payload = {"permission_id": permission_id, **payload}
+                return AgentEvent("permission_request", payload)
+            runtime_log(
+                "tool_permission_denied",
+                {
+                    "conversation_id": conversation_id,
+                    "round_index": round_index,
+                    **payload,
+                },
+            )
+            return AgentEvent("permission_denied", payload)
+        return None
+
+    def _persist_pending_permission(self, pending: _PendingPermission) -> None:
+        self.context.add_assistant_message(
+            pending.conversation_id,
+            pending.assistant_text,
+            pending.reasoning_text,
+            pending.steps,
+            tool_calls=[
+                {"id": call.id, "name": call.name, "arguments": call.arguments}
+                for call in pending.tool_calls
+            ],
+        )
+
+    def _deny_pending_tool_calls(
+        self,
+        pending: _PendingPermission,
+    ) -> Iterator[AgentEvent]:
+        for call in pending.tool_calls:
+            arguments = call.arguments or {}
+            arguments_summary = self._summarize_value(arguments)
+            result = {
+                "status": "denied",
+                "reason": "User denied permission.",
+                "message": (
+                    "The user rejected this tool call. Do not retry the same "
+                    "call unless the user explicitly asks again."
+                ),
+            }
+            result_summary = self._summarize_value(result)
+            runtime_log(
+                "tool_call_result",
+                {
+                    "conversation_id": pending.conversation_id,
+                    "permission_id": pending.id,
+                    "id": call.id,
+                    "name": call.name,
+                    "status": "denied",
+                },
+            )
+            runtime_log(
+                "tool_permission_user_denied",
+                {
+                    "conversation_id": pending.conversation_id,
+                    "permission_id": pending.id,
+                    "id": call.id,
+                    "name": call.name,
+                },
+            )
+            self.context.add_tool_result(
+                pending.conversation_id,
+                call.name,
+                arguments,
+                result,
+                call_id=call.id,
+            )
+            yield AgentEvent(
+                "tool_call_result",
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": arguments,
+                    "argumentsSummary": arguments_summary,
+                    "status": "denied",
+                    "result": result,
+                    "summary": result_summary,
+                },
+            )
+
+    def _direct_permission_resume_answer(
+        self,
+        pending: _PendingPermission,
+        tool_steps: list[dict[str, Any]],
+    ) -> str:
+        if not tool_steps:
+            return ""
+        if any(step.get("status") != "completed" for step in tool_steps):
+            return ""
+        names = {str(step.get("name", "")) for step in tool_steps}
+        if names.issubset({"apply_patch"}):
+            files = []
+            for step in tool_steps:
+                result = step.get("result")
+                if isinstance(result, dict):
+                    files.extend(str(item) for item in result.get("changed_files", []))
+            if files:
+                return "补丁已应用：" + "、".join(sorted(set(files))) + "。"
+            return "补丁已应用。"
+        if names.issubset({"shell_command"}):
+            if all(self._is_clear_shell_success(step) for step in tool_steps):
+                return "操作已完成。"
+            return ""
+        if names.issubset({"write_file", "append_file", "delete_path", "move_path"}):
+            return "操作已完成。"
+        return ""
+
+    def _is_clear_shell_success(self, step: dict[str, Any]) -> bool:
+        result = step.get("result")
+        if not isinstance(result, dict):
+            return False
+        if result.get("exit_code") != 0:
+            return False
+        command = str(result.get("command") or step.get("arguments", {}).get("command") or "")
+        if not command.strip():
+            return False
+        return any(
+            marker in command
+            for marker in (
+                ">",
+                ">>",
+                "rm ",
+                "mv ",
+                "cp ",
+                "mkdir ",
+                "touch ",
+            )
+        )
+
+    def _tool_error_result(self, call: ToolCall, exc: Exception) -> dict[str, Any]:
+        error = str(exc)
+        result = {
+            "error": error,
+            "type": exc.__class__.__name__,
+        }
+        if call.name == "apply_patch":
+            phase = "validate" if "failed to validate patch" in error else "apply"
+            result.update(
+                {
+                    "tool": "apply_patch",
+                    "phase": phase,
+                    "message": (
+                        "The patch was not applied because it failed "
+                        f"{'validation' if phase == 'validate' else 'application'}."
+                    ),
+                    "hint": (
+                        "Use a valid unified diff with diff --git headers, "
+                        "---/+++ file headers, and matching context lines."
+                    ),
+                }
+            )
+        return result
+
+    def _tool_result_summary(
+        self,
+        call: ToolCall,
+        status: str,
+        result: Any,
+    ) -> str:
+        if status == "error" and call.name == "apply_patch" and isinstance(result, dict):
+            detail = str(result.get("error", ""))
+            hint = str(result.get("hint", ""))
+            return self._summarize_value(
+                f"apply_patch failed: {detail}. {hint}",
+                limit=260,
+            )
+        return self._summarize_value(result)
+
+    def _permission_request(
+        self,
+        conversation_id: str,
+        call: ToolCall,
+        *,
+        permission_profile: PermissionProfile | None,
+    ) -> PermissionRequest:
+        try:
+            tool = self.tool_registry.get(call.name)
+            risk_level = tool.risk_level
+            effects = list(tool.effects)
+            capabilities = list(tool.capabilities)
+        except ToolNotFoundError:
+            risk_level = "auto"
+            effects = []
+            capabilities = []
+        return PermissionRequest(
+            id=call.id,
+            conversation_id=conversation_id,
+            tool_name=call.name,
+            arguments=call.arguments or {},
+            risk_level=risk_level,
+            effects=effects,
+            capabilities=capabilities,
+            profile=permission_profile,
+        )
 
     def _split_repeated_tool_calls(
         self,
