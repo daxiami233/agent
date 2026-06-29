@@ -488,7 +488,7 @@ class WebSession:
             },
         )
         is_cancelled = lambda: bool(request_id and request_id in self._cancelled_requests)
-        for event in self.agent.loop.resume_permission(
+        for event in self.agent.resume_permission(
             permission_id,
             approved=approved,
             reasoning_enabled=reasoning_enabled,
@@ -567,7 +567,7 @@ class WebSession:
         )
         is_cancelled = lambda: bool(request_id and request_id in self._cancelled_requests)
         if reuse_existing_user_turn:
-            agent_events = self.agent.loop.run(
+            agent_events = self.agent.continue_conversation(
                 conversation_id,
                 reasoning_enabled=reasoning_enabled,
                 permission_profile=permission_profile,

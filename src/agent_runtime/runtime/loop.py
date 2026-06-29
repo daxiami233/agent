@@ -57,7 +57,11 @@ class _PendingPermission:
 
 
 class AgentLoop:
-    """Coordinates context building, model calls, tool calls, and memory writes."""
+    """Coordinates context building, model calls, tool calls, and memory writes.
+
+    This class is the core execution engine. Application layers should normally
+    call it through ``Agent`` so the public integration surface stays stable.
+    """
 
     def __init__(
         self,
@@ -95,7 +99,12 @@ class AgentLoop:
         permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
-        """Run the model/tool loop for one persisted conversation."""
+        """Run the model/tool loop for one persisted conversation.
+
+        The conversation must already contain the current user turn. The loop
+        may perform multiple model calls: model response, tool execution,
+        observation feedback, and final answer.
+        """
 
         cancelled = is_cancelled or (lambda: False)
         tools = self.tool_registry.provider_schemas()
@@ -333,7 +342,7 @@ class AgentLoop:
         permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
-        """Persist a user message and run the agent loop for that turn."""
+        """Persist a user message and run the full loop for that turn."""
 
         value = user_input.strip()
         if not value:
@@ -362,7 +371,7 @@ class AgentLoop:
         reasoning_enabled: bool = True,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
-        """Resume a paused permission request without asking the model again."""
+        """Resume a paused permission request without regenerating tool calls."""
 
         pending = self._pending_permissions.pop(permission_id, None)
         if pending is None:

@@ -62,7 +62,13 @@ class AgentResponse:
 
 
 class Agent:
-    """SDK-facing agent composed from provider, context, memory, tools, skills, and MCP."""
+    """SDK-facing facade over the core model/tool runtime.
+
+    ``Agent`` is the stable integration boundary for applications such as the
+    web UI. Callers should use this facade for user turns, permission resumes,
+    conversation management, and runtime extension instead of reaching into the
+    underlying ``AgentLoop`` directly.
+    """
 
     def __init__(
         self,
@@ -149,13 +155,61 @@ class Agent:
         permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
-        """Stream one user turn as provider-neutral agent events."""
+        """Persist and stream one user turn as provider-neutral agent events.
+
+        This is the main streaming entrypoint for UI integrations. It appends
+        the user message to memory, builds model context, executes tools when
+        allowed, and yields normalized events for rendering.
+        """
 
         yield from self.loop.run_user_turn(
             conversation_id or self.new_conversation_id(),
             message,
             reasoning_enabled=reasoning_enabled,
             permission_profile=permission_profile,
+            is_cancelled=is_cancelled,
+        )
+
+    def continue_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Continue the loop for a conversation that already has its user turn.
+
+        Use this only when the caller intentionally does not want to append a
+        new user message, for example when resuming legacy approval flows.
+        """
+
+        yield from self.loop.run(
+            conversation_id,
+            reasoning_enabled=reasoning_enabled,
+            permission_profile=permission_profile,
+            is_cancelled=is_cancelled,
+        )
+
+    def resume_permission(
+        self,
+        permission_id: str,
+        *,
+        approved: bool,
+        reasoning_enabled: bool = True,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Resume a pending tool permission request through the public facade.
+
+        A denied request is written back as a synthetic tool result so the model
+        can see that the user rejected the operation if the conversation later
+        continues.
+        """
+
+        yield from self.loop.resume_permission(
+            permission_id,
+            approved=approved,
+            reasoning_enabled=reasoning_enabled,
             is_cancelled=is_cancelled,
         )
 
@@ -215,12 +269,12 @@ class Agent:
         )
 
     def add_tool(self, tool: ToolSpec) -> None:
-        """Register a tool after the agent has been created."""
+        """Register one additional tool after the agent has been created."""
 
         self.tool_registry.register(tool)
 
     def add_skill(self, skill: SkillManifest) -> None:
-        """Register skill metadata for future context construction."""
+        """Register skill metadata and refresh future system prompts."""
 
         self.skill_registry.register(skill)
         self.context.system_prompt = self.skill_registry.apply_to_system_prompt(
@@ -233,9 +287,11 @@ class Agent:
         return str(uuid4())
 
     def clear_conversation(self, conversation_id: str) -> None:
+        """Remove all messages from one conversation while keeping the record."""
         self.context.clear(conversation_id)
 
     def list_conversations(self) -> list[ConversationRecord]:
+        """Return persisted conversations from the configured memory store."""
         return self.memory_store.list_conversations()
 
 

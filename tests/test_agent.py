@@ -9,7 +9,7 @@ from agent_runtime import AgentResponse, AgentRuntimeConfig, create_agent
 from agent_runtime.context import CompressionResult, ContextCompressor
 from agent_runtime.mcp import MCPClientHost
 from agent_runtime.memory import InMemoryMemoryStore, LongTermMemory, MemoryStore, SQLiteLongTermMemory
-from agent_runtime.providers import ModelResponse, ModelStreamEvent, OpenAIProvider
+from agent_runtime.providers import ModelResponse, ModelStreamEvent, OpenAIProvider, ToolCall
 from agent_runtime.skills import SkillManifest
 from agent_runtime.tools import ToolSpec
 
@@ -34,6 +34,33 @@ class StreamingProvider:
                 content=None,
                 finish_reason="stop",
                 usage={"prompt_tokens": 3, "completion_tokens": 2},
+            ),
+        )
+
+
+class PermissionToolProvider:
+    model = "fake-model"
+    base_url = "https://example.test/v1"
+    context_window_tokens = 128000
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(self, input, **kwargs):
+        self.calls += 1
+        yield ModelStreamEvent(
+            type="finish",
+            response=ModelResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "x.txt"},
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 4},
             ),
         )
 
@@ -163,6 +190,47 @@ def test_create_agent_stream_emits_agent_events(tmp_path):
         "assistant_delta",
         "usage",
     ]
+
+
+def test_agent_facade_resumes_pending_permission(tmp_path):
+    executed = []
+    provider = PermissionToolProvider()
+    agent = create_agent(
+        config=AgentRuntimeConfig(
+            data_dir=tmp_path,
+            memory_backend="memory",
+            include_memory_tools=False,
+            include_skill_tools=False,
+            include_shell_tool=False,
+            include_apply_patch_tool=False,
+        ),
+        provider=provider,
+        tools=[
+            ToolSpec(
+                name="write_file",
+                description="Write a file.",
+                input_schema={"type": "object"},
+                handler=lambda arguments: executed.append(arguments) or {"ok": True},
+                effects=["write"],
+            )
+        ],
+        log_context=lambda _conversation_id, _model_input: None,
+    )
+
+    first_events = list(agent.stream("write", conversation_id="conversation-1"))
+    permission_id = first_events[0].payload["permission_id"]
+    approved_events = list(agent.resume_permission(permission_id, approved=True))
+
+    assert provider.calls == 1
+    assert executed == [{"path": "x.txt"}]
+    assert [event.type for event in approved_events] == [
+        "tool_call_start",
+        "tool_call_result",
+        "assistant_start",
+        "assistant_delta",
+        "usage",
+    ]
+    assert approved_events[-2].payload["text"] == "操作已完成。"
 
 
 def test_create_agent_uses_configured_memory_store(tmp_path):

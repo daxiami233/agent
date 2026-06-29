@@ -1,21 +1,18 @@
-"""Skill registration and prompt injection helpers.
+"""Skill registration and system-prompt rendering helpers.
 
-本模块提供技能注册和系统提示词注入功能。
+The registry stores skill metadata only. Full skill instructions remain in the
+skill directory and can be loaded later through skill tools when a task needs
+progressive disclosure.
 
-主要组件：
-- SkillRegistry: 技能注册表，管理可用技能
-- SkillManifest: 技能元数据定义
+Example:
+    from agent_runtime.skills import SkillManifest, SkillRegistry
 
-使用示例：
-    from agent_runtime.skills import SkillRegistry, SkillManifest
-    
     registry = SkillRegistry()
     registry.register(SkillManifest(
         name="weather",
-        description="查询天气信息",
+        description="Look up weather information.",
     ))
-    
-    # 获取带有技能描述的系统提示词
+
     prompt = registry.apply_to_system_prompt()
 """
 
@@ -26,8 +23,8 @@ import re
 from .manifest import SkillManifest
 
 
-# 默认系统提示词模板
-# 使用 {tools}、{skills}、{retrieved_memory} 作为占位符
+# Default system prompt template.
+# Supported placeholders: {tools}, {skills}, and {retrieved_memory}.
 DEFAULT_SYSTEM_PROMPT = """You are Agent Runtime, a local agent. Answer in Chinese. Be concise, accurate, and actionable.
 
 # Tools
@@ -43,20 +40,21 @@ Use available tools and skills when they help. After receiving tool results, ans
 
 
 class SkillRegistry:
-    """技能注册表，管理可用技能并渲染技能描述到系统提示词。
+    """Registry for skill metadata and skill prompt rendering.
 
-    技能是纯粹的元数据（名称、描述、触发条件等），
-    它们被注入到系统提示词中，让模型知道有哪些能力可用。
+    A skill is represented as metadata here: name, description, triggers,
+    required tools, and resource paths. The rendered system prompt gives the
+    model a compact list of available skills without loading every full
+    ``SKILL.md`` file into the context.
 
-    使用示例：
+    Example:
         registry = SkillRegistry()
         registry.register(SkillManifest(
             name="weather",
-            description="查询天气信息",
-            triggers=["天气", "温度"],
+            description="Look up weather information.",
+            triggers=["weather", "temperature"],
         ))
-        
-        # 获取带有技能描述的系统提示词
+
         prompt = registry.apply_to_system_prompt()
     """
 
@@ -66,13 +64,13 @@ class SkillRegistry:
             self.register(skill)
 
     def register(self, skill: SkillManifest) -> None:
-        """注册一个技能。
+        """Register one skill manifest.
 
         Args:
-            skill: 技能元数据
+            skill: Skill metadata loaded from code or a ``SKILL.md`` file.
 
         Raises:
-            ValueError: 如果技能名称为空或已存在
+            ValueError: If the skill name is empty or already registered.
         """
         if not skill.name:
             raise ValueError("Skill name is required.")
@@ -81,10 +79,10 @@ class SkillRegistry:
         self._skills[skill.name] = skill
 
     def list(self) -> list[SkillManifest]:
-        """列出所有已注册的技能。
+        """Return all registered skills sorted by name.
 
         Returns:
-            技能列表，按名称排序
+            Skill manifests sorted by name.
         """
         return [self._skills[name] for name in sorted(self._skills)]
 
@@ -100,16 +98,18 @@ class SkillRegistry:
         return name in self._skills
 
     def apply_to_system_prompt(self, system_prompt: str | None = None) -> str:
-        """将技能描述注入到系统提示词中。
+        """Inject compact skill metadata into a system prompt template.
 
-        如果有注册的技能，会在 {skills} 占位符位置插入技能列表。
-        如果没有注册的技能，会移除 {skills} 相关的内容。
+        Registered skills are rendered at the ``{skills}`` placeholder. If the
+        template has already been rendered, the previous skill block is removed
+        before a fresh block is appended.
 
         Args:
-            system_prompt: 系统提示词模板，如果为 None 则使用默认模板
+            system_prompt: Optional prompt template. The default template is
+                used when this is ``None``.
 
         Returns:
-            注入技能描述后的系统提示词
+            A prompt containing the current compact skill list.
         """
         prompt = (system_prompt or DEFAULT_SYSTEM_PROMPT).strip()
         skills = self.list()
