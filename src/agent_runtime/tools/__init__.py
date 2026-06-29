@@ -1,6 +1,7 @@
 """Tool specifications and registry."""
 
 from .builtin.list_skills import list_skills_tool
+from .builtin.apply_patch import apply_patch_tool
 from .builtin.memory import (
     memory_append_tool,
     memory_read_tool,
@@ -39,6 +40,7 @@ __all__ = [
     "ToolRegistry",
     "ToolRegistryError",
     "ToolSpec",
+    "apply_patch_tool",
     "built_in_tool_registry",
     "list_skills_tool",
     "memory_append_tool",

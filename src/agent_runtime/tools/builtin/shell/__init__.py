@@ -226,6 +226,7 @@ def shell_command_tool(
         },
         handler=handle,
         capabilities=["shell"],
+        effects=["execute"],
     )
 
 

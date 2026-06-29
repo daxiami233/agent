@@ -25,7 +25,9 @@ const LEGACY_STORAGE_KEY = "agent-runtime-web-state-v1";
 const ACTIVE_CONVERSATION_KEY = "agent-runtime-active-conversation-v1";
 const ACTIVE_PROJECT_KEY = "agent-runtime-active-project-v1";
 const REASONING_ENABLED_KEY = "agent-runtime-reasoning-enabled-v1";
+const PERMISSION_PROFILE_KEY = "agent-runtime-permission-profile-v1";
 const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
+const PERMISSION_PROFILES = new Set(["read_only", "workspace", "full_access"]);
 
 function isNearBottom(element) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
@@ -149,6 +151,97 @@ function CommandPanel({ panel, onClose }) {
       </div>
     </section>
   );
+}
+
+function PermissionPanel({ prompt, onAllow, onDeny }) {
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onDeny();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onDeny]);
+
+  const request = prompt.request ?? {};
+  const details = permissionDetails(request);
+
+  return (
+    <section className="commandPanel permissionPanel">
+      <header>
+        <h2>权限确认</h2>
+        <div className="commandPanelActions">
+          <code>{request.tool_name || "tool"}</code>
+          <button type="button" onClick={onDeny}>拒绝</button>
+          <button type="button" className="primary" onClick={onAllow}>允许本次</button>
+        </div>
+      </header>
+      <div className="commandPanelBody">
+        <p>{details.reason}</p>
+        <dl className="permissionSummary">
+          {details.rows.map((row) => (
+            <div key={row.label}>
+              <dt>{row.label}</dt>
+              <dd title={row.title ?? row.value}>{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+    </section>
+  );
+}
+
+function permissionDetails(request) {
+  const args = request.arguments ?? {};
+  const effects = Array.isArray(request.effects) ? request.effects.join(", ") : "";
+  const rows = [];
+  if (effects) rows.push({ label: "影响", value: effects });
+
+  if (request.tool_name === "apply_patch" && typeof args.patch === "string") {
+    const patch = summarizePatch(args.patch);
+    rows.push({ label: "文件", value: patch.files || "未识别", title: patch.files });
+    rows.push({ label: "大小", value: `${patch.lines} 行 / ${patch.chars} 字符` });
+    if (args.cwd) rows.push({ label: "目录", value: compactText(String(args.cwd), 80) });
+    if (args.dry_run) rows.push({ label: "模式", value: "仅验证" });
+  } else if (request.tool_name === "shell_command") {
+    rows.push({ label: "命令", value: compactText(String(args.command ?? ""), 120) });
+    if (args.cwd) rows.push({ label: "目录", value: compactText(String(args.cwd), 80) });
+  } else {
+    const preview = JSON.stringify(args);
+    rows.push({ label: "参数", value: compactText(preview, 160), title: preview });
+  }
+
+  return {
+    reason: request.reason || "工具调用需要确认。",
+    rows,
+  };
+}
+
+function summarizePatch(patch) {
+  const files = [];
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      const parts = line.split(/\s+/);
+      if (parts.length >= 4) files.push(parts[3].replace(/^b\//, ""));
+    } else if (line.startsWith("+++ b/")) {
+      files.push(line.slice(6).split("\t", 1)[0]);
+    }
+  }
+  return {
+    files: [...new Set(files)].slice(0, 6).join(", "),
+    lines: patch.split("\n").length,
+    chars: patch.length,
+  };
+}
+
+function compactText(value, maxLength) {
+  const normalized = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  const headLength = Math.ceil((maxLength - 3) * 0.62);
+  const tailLength = Math.floor((maxLength - 3) * 0.38);
+  return `${normalized.slice(0, headLength)}...${normalized.slice(-tailLength)}`;
 }
 
 function RuntimeLogModal({ log, loading, error, onRefresh, onClear, onClose }) {
@@ -356,9 +449,18 @@ export default function App() {
       return true;
     }
   });
+  const [toolPermissionProfile, setToolPermissionProfile] = useState(() => {
+    try {
+      const stored = localStorage.getItem(PERMISSION_PROFILE_KEY);
+      return PERMISSION_PROFILES.has(stored) ? stored : "workspace";
+    } catch {
+      return "workspace";
+    }
+  });
   const [activeRequests, setActiveRequests] = useState({});
   const [error, setError] = useState("");
   const [commandPanel, setCommandPanel] = useState(null);
+  const [permissionPrompt, setPermissionPrompt] = useState(null);
   const [activeCommandIndex, setActiveCommandIndex] = useState(0);
   const [commandMenuDismissed, setCommandMenuDismissed] = useState(false);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
@@ -422,6 +524,14 @@ export default function App() {
       // localStorage may be unavailable in restricted browser contexts.
     }
   }, [reasoningEnabled]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PERMISSION_PROFILE_KEY, toolPermissionProfile);
+    } catch {
+      // localStorage may be unavailable in restricted browser contexts.
+    }
+  }, [toolPermissionProfile]);
 
   function updateConversationMessages(conversationId, updater) {
     setConversationState((current) => ({
@@ -590,22 +700,26 @@ export default function App() {
     await submitText(input.trim(), activeConversation.id);
   }
 
-  async function submitText(value, conversationId) {
+  async function submitText(value, conversationId, options = {}) {
     if (!value || activeRequests[conversationId]) return;
+    const permissionApproved = Boolean(options.permissionApproved);
+    const permissionResume = permissionApproved || Boolean(options.permissionDenied);
+    const permissionProfile = options.permissionProfile ?? toolPermissionProfile;
     autoFollowRef.current = true;
     setShowJumpToBottom(false);
     requestAnimationFrame(() => scrollTranscriptToBottom());
     const requestId = uid();
     const controller = new AbortController();
     controllersRef.current.set(conversationId, controller);
-    setInput("");
+    if (!permissionResume) setInput("");
     setError("");
+    setPermissionPrompt(null);
     setCommandMenuDismissed(false);
     setActiveRequests((current) => ({
       ...current,
       [conversationId]: { requestId },
     }));
-    const isCommand = value.startsWith("/") || value.startsWith(":");
+    const isCommand = !permissionResume && (value.startsWith("/") || value.startsWith(":"));
     if (isCommand) {
       setCommandPanel({
         id: uid(),
@@ -614,19 +728,36 @@ export default function App() {
         lines: [],
         tone: "info",
       });
-    } else {
+    } else if (!permissionResume) {
       rememberPrompt(value);
       renameConversationFromPrompt(conversationId, value);
     }
     try {
+      let awaitingPermissionNotice = false;
       await sendChat(conversationId, value, requestId, reasoningEnabled, controller, (event) => {
         if (isCommand) {
           applyCommandEvent(event, setCommandPanel, setStatus);
         } else {
+          if (event.type === "permission_request") {
+            awaitingPermissionNotice = true;
+            setPermissionPrompt({
+              id: uid(),
+              conversationId,
+              message: value,
+              request: event,
+            });
+            return;
+          }
+          if (awaitingPermissionNotice && event.type === "notice") return;
           if (!reasoningEnabled && event.type === "reasoning_delta") return;
           if (event.type === "status") updateConversationStatus(conversationId, event);
           applyEvent(event, (updater) => updateConversationMessages(conversationId, updater), setStatus);
         }
+      }, {
+        permissionProfile,
+        permissionApproved,
+        permissionDenied: Boolean(options.permissionDenied),
+        permissionId: options.permissionId ?? "",
       });
     } catch (err) {
       if (err.name !== "AbortError") {
@@ -720,6 +851,27 @@ export default function App() {
     submitText(name, activeConversation.id);
   }
 
+  function allowPermissionPrompt() {
+    const prompt = permissionPrompt;
+    if (!prompt) return;
+    setPermissionPrompt(null);
+    submitText(prompt.message, prompt.conversationId, {
+      permissionProfile: "full_access",
+      permissionApproved: true,
+      permissionId: prompt.request?.permission_id ?? "",
+    });
+  }
+
+  function denyPermissionPrompt() {
+    const prompt = permissionPrompt;
+    if (!prompt) return;
+    setPermissionPrompt(null);
+    submitText(prompt.message, prompt.conversationId, {
+      permissionDenied: true,
+      permissionId: prompt.request?.permission_id ?? "",
+    });
+  }
+
   function updateProjectConversationCount(projectId, updater) {
     setProjects((current) =>
       current.map((project) => {
@@ -770,6 +922,7 @@ export default function App() {
       setPromptHistory(promptsFromConversations(items));
       setInput("");
       setCommandMenuDismissed(false);
+      if (payload.status) setStatus((current) => ({ ...current, ...payload.status }));
       applyConversationStatus(items[0] ?? null);
       if (items.length > 0) {
         requestAnimationFrame(() => document.querySelector(".composer textarea")?.focus());
@@ -1094,10 +1247,17 @@ export default function App() {
                 onHover={setActiveCommandIndex}
               />
             </div>
+            {permissionPrompt && (
+              <PermissionPanel
+                prompt={permissionPrompt}
+                onAllow={allowPermissionPrompt}
+                onDeny={denyPermissionPrompt}
+              />
+            )}
             {commandPanel && (
               <CommandPanel panel={commandPanel} onClose={() => setCommandPanel(null)} />
             )}
-            {!commandPanel && error && <div className="error">{error}</div>}
+            {!permissionPrompt && !commandPanel && error && <div className="error">{error}</div>}
             <div className="composer">
               <textarea
                 ref={textareaRef}
@@ -1119,6 +1279,18 @@ export default function App() {
               >
                 {reasoningEnabled ? "思考开" : "思考关"}
               </button>
+              <select
+                className={`permissionProfileSelect ${toolPermissionProfile}`}
+                value={toolPermissionProfile}
+                onChange={(event) => setToolPermissionProfile(event.target.value)}
+                disabled={Boolean(activeRequest)}
+                aria-label="工具权限"
+                title="工具权限模式"
+              >
+                <option value="workspace">权限确认</option>
+                <option value="read_only">只读</option>
+                <option value="full_access">全权限</option>
+              </select>
               <button
                 type="button"
                 className={activeRequest ? "stop" : ""}

@@ -31,4 +31,5 @@ def list_skills_tool(registry: SkillRegistry) -> ToolSpec:
         },
         handler=handle,
         capabilities=["skills"],
+        effects=["read"],
     )

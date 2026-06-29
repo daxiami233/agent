@@ -13,7 +13,7 @@ web UI is a React single-page app, and runtime state is stored locally.
 - Multi-step agent loop with tool execution and observation feedback.
 - OpenAI-compatible provider abstraction with Responses API and Chat
   Completions support.
-- Tool registry with built-in shell, memory, and skill tools.
+- Tool registry with built-in shell, patch, memory, and skill tools.
 - Skill loading from `SKILL.md` files.
 - SQLite-backed conversation memory and long-term memory support.
 - Context compression with a single leading summary message.
@@ -125,6 +125,7 @@ Common environment variables:
 | `ENABLE_MEMORY_TOOLS` | Register memory tools | `true` |
 | `ENABLE_SKILL_TOOLS` | Register skill tools | `true` |
 | `ENABLE_SHELL_TOOL` | Register shell tool | `true` |
+| `ENABLE_APPLY_PATCH_TOOL` | Register patch application tool | `true` |
 | `SHELL_TIMEOUT_SECONDS` | Shell command timeout | `30` |
 | `SHELL_MAX_OUTPUT_CHARS` | Max shell output returned directly to model | `20000` |
 | `SKILL_PATHS` | Extra skill directories, separated by OS path separator | empty |

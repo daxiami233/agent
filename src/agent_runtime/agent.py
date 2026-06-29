@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -27,12 +28,19 @@ from agent_runtime.memory import (
     SQLiteLongTermMemory,
     SQLiteMemoryStore,
 )
+from agent_runtime.permissions import (
+    DefaultPermissionPolicy,
+    PermissionManager,
+    PermissionPolicyProtocol,
+    PermissionProfile,
+)
 from agent_runtime.providers import OpenAIProvider, Provider
 from agent_runtime.runtime import AgentEvent, AgentLoop
 from agent_runtime.skills import SkillManifest, SkillRegistry, load_builtin_skills, load_skills
 from agent_runtime.tools import (
     ToolRegistry,
     ToolSpec,
+    apply_patch_tool,
     list_skills_tool,
     memory_tools,
     shell_command_tool,
@@ -54,7 +62,13 @@ class AgentResponse:
 
 
 class Agent:
-    """SDK-facing agent composed from provider, context, memory, tools, skills, and MCP."""
+    """SDK-facing facade over the core model/tool runtime.
+
+    ``Agent`` is the stable integration boundary for applications such as the
+    web UI. Callers should use this facade for user turns, permission resumes,
+    conversation management, and runtime extension instead of reaching into the
+    underlying ``AgentLoop`` directly.
+    """
 
     def __init__(
         self,
@@ -65,6 +79,7 @@ class Agent:
         tool_registry: ToolRegistry | None = None,
         skill_registry: SkillRegistry | None = None,
         mcp_host: MCPClientHost | None = None,
+        permission_manager: PermissionManager | None = None,
         log_context: Callable[[str, list[dict[str, Any]]], None] | None = None,
         base_system_prompt: str | None = None,
         model_timeout_seconds: float = 60,
@@ -87,6 +102,8 @@ class Agent:
                 advanced skill selection.
             mcp_host: Optional MCP host. Any tools exposed by this host are
                 registered into ``tool_registry`` during initialization.
+            permission_manager: Optional manager used to evaluate tool-call
+                permissions before execution.
             log_context: Optional callback that receives the final model input for
                 debugging or observability. Pass a no-op to suppress default logs.
             base_system_prompt: Raw prompt template used when skills are re-rendered
@@ -124,6 +141,7 @@ class Agent:
             provider=self.provider,
             context=self.context,
             tool_registry=self.tool_registry,
+            permission_manager=permission_manager,
             log_context=log_context,
             model_timeout_seconds=model_timeout_seconds,
         )
@@ -134,13 +152,63 @@ class Agent:
         *,
         conversation_id: str | None = None,
         reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> Iterator[AgentEvent]:
-        """Stream one user turn as provider-neutral agent events."""
+        """Persist and stream one user turn as provider-neutral agent events.
+
+        This is the main streaming entrypoint for UI integrations. It appends
+        the user message to memory, builds model context, executes tools when
+        allowed, and yields normalized events for rendering.
+        """
 
         yield from self.loop.run_user_turn(
             conversation_id or self.new_conversation_id(),
             message,
+            reasoning_enabled=reasoning_enabled,
+            permission_profile=permission_profile,
+            is_cancelled=is_cancelled,
+        )
+
+    def continue_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Continue the loop for a conversation that already has its user turn.
+
+        Use this only when the caller intentionally does not want to append a
+        new user message, for example when resuming legacy approval flows.
+        """
+
+        yield from self.loop.run(
+            conversation_id,
+            reasoning_enabled=reasoning_enabled,
+            permission_profile=permission_profile,
+            is_cancelled=is_cancelled,
+        )
+
+    def resume_permission(
+        self,
+        permission_id: str,
+        *,
+        approved: bool,
+        reasoning_enabled: bool = True,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[AgentEvent]:
+        """Resume a pending tool permission request through the public facade.
+
+        A denied request is written back as a synthetic tool result so the model
+        can see that the user rejected the operation if the conversation later
+        continues.
+        """
+
+        yield from self.loop.resume_permission(
+            permission_id,
+            approved=approved,
             reasoning_enabled=reasoning_enabled,
             is_cancelled=is_cancelled,
         )
@@ -151,6 +219,7 @@ class Agent:
         *,
         conversation_id: str | None = None,
         reasoning_enabled: bool = True,
+        permission_profile: PermissionProfile | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> AgentResponse:
         """Run one user turn and collect streamed events into a response object."""
@@ -167,6 +236,7 @@ class Agent:
             message,
             conversation_id=resolved_conversation_id,
             reasoning_enabled=reasoning_enabled,
+            permission_profile=permission_profile,
             is_cancelled=is_cancelled,
         ):
             events.append(event)
@@ -199,12 +269,12 @@ class Agent:
         )
 
     def add_tool(self, tool: ToolSpec) -> None:
-        """Register a tool after the agent has been created."""
+        """Register one additional tool after the agent has been created."""
 
         self.tool_registry.register(tool)
 
     def add_skill(self, skill: SkillManifest) -> None:
-        """Register skill metadata for future context construction."""
+        """Register skill metadata and refresh future system prompts."""
 
         self.skill_registry.register(skill)
         self.context.system_prompt = self.skill_registry.apply_to_system_prompt(
@@ -217,9 +287,11 @@ class Agent:
         return str(uuid4())
 
     def clear_conversation(self, conversation_id: str) -> None:
+        """Remove all messages from one conversation while keeping the record."""
         self.context.clear(conversation_id)
 
     def list_conversations(self) -> list[ConversationRecord]:
+        """Return persisted conversations from the configured memory store."""
         return self.memory_store.list_conversations()
 
 
@@ -239,6 +311,8 @@ def create_agent(
     token_counter: TokenCounterProtocol | None = None,
     compressor: ContextCompressor | None = None,
     mcp_host: MCPClientHost | None = None,
+    permission_policy: PermissionPolicyProtocol | None = None,
+    working_directory: Path | str | None = None,
 ) -> Agent:
     """Create a local agent from config, optional provider, tools, and skills.
 
@@ -261,6 +335,10 @@ def create_agent(
         token_counter: Advanced override for token budgeting.
         compressor: Advanced override for context summarization.
         mcp_host: Optional MCP host that contributes tools to the registry.
+        permission_policy: Optional policy for tool-call permissions. Business
+            systems can inject this to keep Agent core decoupled from business rules.
+        working_directory: Optional local project directory used by built-in
+            shell and patch tools.
 
     Example:
         agent = create_agent()
@@ -308,6 +386,11 @@ def create_agent(
     )
     resolved_tool_registry = ToolRegistry()
     builtin_tool_count = 0
+    resolved_working_directory = (
+        Path(working_directory).expanduser().resolve()
+        if working_directory is not None
+        else None
+    )
     if runtime_config.include_memory_tools:
         for tool in memory_tools(resolved_long_term_memory):
             resolved_tool_registry.register(tool)
@@ -322,10 +405,16 @@ def create_agent(
     if runtime_config.include_shell_tool:
         resolved_tool_registry.register(
             shell_command_tool(
+                default_cwd=resolved_working_directory,
                 timeout_seconds=runtime_config.shell_timeout_seconds,
                 max_output_chars=runtime_config.shell_max_output_chars,
                 artifact_dir=runtime_config.data_dir / "artifacts",
             )
+        )
+        builtin_tool_count += 1
+    if runtime_config.include_apply_patch_tool:
+        resolved_tool_registry.register(
+            apply_patch_tool(default_cwd=resolved_working_directory)
         )
         builtin_tool_count += 1
     resolved_tool_registry.register(list_skills_tool(resolved_skill_registry))
@@ -345,10 +434,14 @@ def create_agent(
         max_summary_tokens=runtime_config.compact_summary_tokens,
         timeout_seconds=runtime_config.provider_timeout_seconds,
     )
+    resolved_system_prompt = _apply_working_directory_prompt(
+        resolved_skill_registry.apply_to_system_prompt(system_prompt),
+        resolved_working_directory,
+    )
     resolved_context = ContextEngine(
         resolved_memory_store,
         system_prompt=_apply_tool_prompt(
-            resolved_skill_registry.apply_to_system_prompt(system_prompt),
+            resolved_system_prompt,
             total_tool_count=builtin_tool_count + user_tool_count,
             user_tool_count=user_tool_count,
         ),
@@ -362,6 +455,10 @@ def create_agent(
         token_counter=resolved_token_counter,
         compressor=resolved_compressor,
     )
+    resolved_permission_policy = permission_policy or DefaultPermissionPolicy(
+        profile=runtime_config.tool_permission_profile,
+    )
+    resolved_permission_manager = PermissionManager(resolved_permission_policy)
 
     return Agent(
         provider=resolved_provider,
@@ -369,6 +466,7 @@ def create_agent(
         tool_registry=resolved_tool_registry,
         skill_registry=resolved_skill_registry,
         mcp_host=mcp_host,
+        permission_manager=resolved_permission_manager,
         log_context=log_context,
         base_system_prompt=system_prompt or "",
         model_timeout_seconds=runtime_config.provider_timeout_seconds,
@@ -461,6 +559,24 @@ def _apply_tool_prompt(
     if "{tools}" in prompt:
         return prompt.replace("{tools}", tools_text)
     return f"{prompt}\n\n# Tools\n{tools_text}"
+
+
+def _apply_working_directory_prompt(
+    prompt: str,
+    working_directory: Path | None,
+) -> str:
+    if working_directory is None:
+        return prompt
+    return (
+        f"{prompt}\n\n# Current Workspace\n"
+        f"Current working directory: {working_directory}\n"
+        "When the user refers to the current project, current folder, this folder, "
+        "or local files without a path, treat this directory as the default scope. "
+        "For destructive operations, if the target and scope are clear, call the "
+        "tool directly and let the runtime permission flow ask the user for "
+        "approval before execution. Ask the user only when the target, scope, "
+        "or intent is ambiguous."
+    )
 
 
 def _check_skill_conflicts(

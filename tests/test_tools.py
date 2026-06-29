@@ -14,6 +14,7 @@ from agent_runtime.tools import (
     ToolNotFoundError,
     ToolRegistry,
     ToolSpec,
+    apply_patch_tool,
     built_in_tool_registry,
     list_skills_tool,
     memory_tools,
@@ -339,6 +340,62 @@ def test_shell_command_tool_redacts_sensitive_output(tmp_path):
     )
 
     assert result["stdout"] == "API_KEY=[redacted]"
+
+
+def test_apply_patch_tool_applies_unified_diff(tmp_path):
+    target = tmp_path / "note.txt"
+    target.write_text("hello\n", encoding="utf-8")
+    patch = """\
+diff --git a/note.txt b/note.txt
+--- a/note.txt
++++ b/note.txt
+@@ -1 +1 @@
+-hello
++hello world
+"""
+    registry = ToolRegistry([apply_patch_tool(default_cwd=tmp_path)])
+
+    result = registry.execute("apply_patch", {"patch": patch})
+
+    assert result["ok"] is True
+    assert result["changed_files"] == ["note.txt"]
+    assert target.read_text(encoding="utf-8") == "hello world\n"
+
+
+def test_apply_patch_tool_dry_run_does_not_modify_file(tmp_path):
+    target = tmp_path / "note.txt"
+    target.write_text("hello\n", encoding="utf-8")
+    patch = """\
+diff --git a/note.txt b/note.txt
+--- a/note.txt
++++ b/note.txt
+@@ -1 +1 @@
+-hello
++hello world
+"""
+    registry = ToolRegistry([apply_patch_tool(default_cwd=tmp_path)])
+
+    result = registry.execute("apply_patch", {"patch": patch, "dry_run": True})
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert target.read_text(encoding="utf-8") == "hello\n"
+
+
+def test_apply_patch_tool_blocks_env_files(tmp_path):
+    (tmp_path / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    patch = """\
+diff --git a/.env b/.env
+--- a/.env
++++ b/.env
+@@ -1 +1 @@
+-API_KEY=secret
++API_KEY=other
+"""
+    registry = ToolRegistry([apply_patch_tool(default_cwd=tmp_path)])
+
+    with pytest.raises(ValueError, match="sensitive file"):
+        registry.execute("apply_patch", {"patch": patch})
 
 
 def test_tool_from_function_builds_schema_and_handler():

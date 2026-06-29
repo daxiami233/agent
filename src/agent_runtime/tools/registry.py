@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from types import UnionType
 from typing import Any, Callable, Literal, Union, get_args, get_origin, get_type_hints
 
+from agent_runtime.permissions import Effect, RiskLevel
+
 
 ToolHandler = Callable[[dict[str, Any]], Any]
 
@@ -36,6 +38,8 @@ class ToolSpec:
     input_schema: dict[str, Any]
     handler: ToolHandler
     capabilities: list[str] = field(default_factory=list)
+    risk_level: RiskLevel = "auto"
+    effects: list[Effect] = field(default_factory=list)
 
     def provider_schema(self) -> dict[str, Any]:
         """Return the function-tool shape accepted by OpenAI-compatible providers."""
@@ -92,6 +96,17 @@ class ToolRegistry:
             raise ValueError("Tool description is required.")
         if not isinstance(tool.input_schema, dict):
             raise ValueError("Tool input_schema must be a dictionary.")
+        if tool.risk_level not in {"auto", "confirm", "blocked"}:
+            raise ValueError("Tool risk_level must be auto, confirm, or blocked.")
+        invalid_effects = set(tool.effects) - {
+            "read",
+            "write",
+            "execute",
+            "network",
+            "destructive",
+        }
+        if invalid_effects:
+            raise ValueError(f"Invalid tool effects: {sorted(invalid_effects)}")
 
 
 def tool_from_function(
@@ -100,6 +115,8 @@ def tool_from_function(
     name: str | None = None,
     description: str | None = None,
     capabilities: list[str] | None = None,
+    risk_level: RiskLevel = "auto",
+    effects: list[Effect] | None = None,
 ) -> ToolSpec:
     """Create a ToolSpec from a regular Python function.
 
@@ -149,6 +166,8 @@ def tool_from_function(
         input_schema=schema,
         handler=handle,
         capabilities=capabilities or [],
+        risk_level=risk_level,
+        effects=effects or [],
     )
 
 
@@ -158,6 +177,8 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     capabilities: list[str] | None = None,
+    risk_level: RiskLevel = "auto",
+    effects: list[Effect] | None = None,
 ) -> ToolSpec | Callable[[Callable[..., Any]], ToolSpec]:
     """Decorator/function helper that turns a Python function into a ToolSpec."""
 
@@ -167,6 +188,8 @@ def tool(
             name=name,
             description=description,
             capabilities=capabilities,
+            risk_level=risk_level,
+            effects=effects,
         )
 
     if func is None:

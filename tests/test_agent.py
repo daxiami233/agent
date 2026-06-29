@@ -9,7 +9,7 @@ from agent_runtime import AgentResponse, AgentRuntimeConfig, create_agent
 from agent_runtime.context import CompressionResult, ContextCompressor
 from agent_runtime.mcp import MCPClientHost
 from agent_runtime.memory import InMemoryMemoryStore, LongTermMemory, MemoryStore, SQLiteLongTermMemory
-from agent_runtime.providers import ModelResponse, ModelStreamEvent, OpenAIProvider
+from agent_runtime.providers import ModelResponse, ModelStreamEvent, OpenAIProvider, ToolCall
 from agent_runtime.skills import SkillManifest
 from agent_runtime.tools import ToolSpec
 
@@ -34,6 +34,33 @@ class StreamingProvider:
                 content=None,
                 finish_reason="stop",
                 usage={"prompt_tokens": 3, "completion_tokens": 2},
+            ),
+        )
+
+
+class PermissionToolProvider:
+    model = "fake-model"
+    base_url = "https://example.test/v1"
+    context_window_tokens = 128000
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(self, input, **kwargs):
+        self.calls += 1
+        yield ModelStreamEvent(
+            type="finish",
+            response=ModelResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "x.txt"},
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 4},
             ),
         )
 
@@ -128,6 +155,8 @@ def test_root_package_exports_common_sdk_types():
     assert agent_runtime.ToolSpec is ToolSpec
     assert agent_runtime.SkillManifest is SkillManifest
     assert agent_runtime.Provider is not None
+    assert agent_runtime.PermissionPolicyProtocol is not None
+    assert agent_runtime.PermissionRequest is not None
     assert callable(agent_runtime.tool)
 
 
@@ -161,6 +190,47 @@ def test_create_agent_stream_emits_agent_events(tmp_path):
         "assistant_delta",
         "usage",
     ]
+
+
+def test_agent_facade_resumes_pending_permission(tmp_path):
+    executed = []
+    provider = PermissionToolProvider()
+    agent = create_agent(
+        config=AgentRuntimeConfig(
+            data_dir=tmp_path,
+            memory_backend="memory",
+            include_memory_tools=False,
+            include_skill_tools=False,
+            include_shell_tool=False,
+            include_apply_patch_tool=False,
+        ),
+        provider=provider,
+        tools=[
+            ToolSpec(
+                name="write_file",
+                description="Write a file.",
+                input_schema={"type": "object"},
+                handler=lambda arguments: executed.append(arguments) or {"ok": True},
+                effects=["write"],
+            )
+        ],
+        log_context=lambda _conversation_id, _model_input: None,
+    )
+
+    first_events = list(agent.stream("write", conversation_id="conversation-1"))
+    permission_id = first_events[0].payload["permission_id"]
+    approved_events = list(agent.resume_permission(permission_id, approved=True))
+
+    assert provider.calls == 1
+    assert executed == [{"path": "x.txt"}]
+    assert [event.type for event in approved_events] == [
+        "tool_call_start",
+        "tool_call_result",
+        "assistant_start",
+        "assistant_delta",
+        "usage",
+    ]
+    assert approved_events[-2].payload["text"] == "操作已完成。"
 
 
 def test_create_agent_uses_configured_memory_store(tmp_path):
@@ -299,6 +369,21 @@ def test_create_agent_passes_provider_timeout_to_agent_loop(tmp_path):
     assert agent.loop.model_timeout_seconds == 12
 
 
+def test_create_agent_includes_working_directory_in_system_prompt(tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    agent = create_agent(
+        config=AgentRuntimeConfig(data_dir=tmp_path),
+        provider=StreamingProvider(),
+        working_directory=project_dir,
+        log_context=lambda _conversation_id, _model_input: None,
+    )
+
+    assert "# Current Workspace" in agent.context.system_prompt
+    assert f"Current working directory: {project_dir.resolve()}" in agent.context.system_prompt
+
+
 def test_create_agent_registers_optional_runtime_tools(tmp_path):
     provider = StreamingProvider()
     skill_dir = tmp_path / "skill"
@@ -337,6 +422,7 @@ def test_create_agent_registers_optional_runtime_tools(tmp_path):
         "skill_read",
         "skill_read_resource",
         "shell_command",
+        "apply_patch",
     }.issubset(tool_names)
 
 
@@ -364,6 +450,7 @@ def test_create_agent_enables_core_local_tools_by_default(tmp_path):
         "skill_read",
         "skill_read_resource",
         "shell_command",
+        "apply_patch",
     }.issubset(tool_names)
     assert "weather" not in tool_names
 

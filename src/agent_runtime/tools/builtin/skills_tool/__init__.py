@@ -69,6 +69,7 @@ def skill_read_tool(
         },
         handler=handle,
         capabilities=["skills"],
+        effects=["read"],
     )
 
 
@@ -119,6 +120,7 @@ def skill_read_resource_tool(
         },
         handler=handle,
         capabilities=["skills"],
+        effects=["read"],
     )
 
 

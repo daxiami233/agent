@@ -159,18 +159,32 @@ def runtime_log_message(event: str, payload: dict[str, Any]) -> str:
     conversation = _short_id(payload.get("conversation_id"))
     prefix = f"[{conversation}] " if conversation else ""
     if event == "web_session_init":
-        return f"Web 会话初始化：默认项目 {payload.get('default_project', '')}"
+        return f"Web 会话初始化：启动目录 {payload.get('startup_directory', '')}"
     if event == "web_session_agent_ready":
         tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
+        working_directory = str(payload.get("working_directory", ""))
+        suffix = f"，工作目录 {working_directory}" if working_directory else ""
         return (
             f"模型就绪：{payload.get('model', '')} "
-            f"({payload.get('provider', '')})，工具 {len(tools)} 个"
+            f"({payload.get('provider', '')})，工具 {len(tools)} 个{suffix}"
         )
     if event == "web_session_provider_error":
         return f"模型服务初始化失败：{payload.get('error', '')}"
     if event in {"web_submit", "user_turn_start"}:
         text = payload.get("text_preview") or payload.get("input_preview") or ""
-        return f"{prefix}用户输入：{text}"
+        permission_suffix = ""
+        if event == "web_submit":
+            permission_profile = str(payload.get("permission_profile") or "")
+            if payload.get("permission_approved"):
+                permission_suffix = (
+                    "，权限确认已通过"
+                    + (f" ({permission_profile})" if permission_profile else "")
+                )
+            elif payload.get("permission_denied"):
+                permission_suffix = "，权限确认已拒绝"
+            elif permission_profile:
+                permission_suffix = f"，权限档位 {permission_profile}"
+        return f"{prefix}用户输入：{text}{permission_suffix}"
     if event == "web_command":
         return f"{prefix}执行命令：{payload.get('command', '')}"
     if event == "web_cancel":
@@ -216,6 +230,46 @@ def runtime_log_message(event: str, payload: dict[str, Any]) -> str:
             detail = payload.get("error") or payload.get("error_type") or "unknown"
             return f"{prefix}工具结束：{payload.get('name', '')} (error: {detail})"
         return f"{prefix}工具结束：{payload.get('name', '')} ({payload.get('status', '')})"
+    if event == "tool_permission_decision":
+        effects = _list_text(payload.get("effects"))
+        effect_suffix = f"，影响 {effects}" if effects else ""
+        reason = str(payload.get("reason") or "")
+        reason_suffix = f"，原因：{reason}" if reason else ""
+        return (
+            f"{prefix}权限判定：{payload.get('name', '')} -> "
+            f"{_permission_action_text(payload.get('action'))}"
+            f"，风险 {payload.get('risk_level', 'auto')}"
+            f"{effect_suffix}{reason_suffix}"
+        )
+    if event == "tool_permission_required":
+        effects = _list_text(payload.get("effects"))
+        effect_suffix = f"，影响 {effects}" if effects else ""
+        reason = str(payload.get("reason") or "")
+        reason_suffix = f"，原因：{reason}" if reason else ""
+        return (
+            f"{prefix}工具需要权限确认：{payload.get('tool_name', '')}"
+            f"，风险 {payload.get('risk_level', 'auto')}"
+            f"{effect_suffix}{reason_suffix}"
+        )
+    if event == "tool_permission_resume":
+        state = "通过" if payload.get("approved") else "拒绝"
+        return (
+            f"{prefix}权限恢复：{state}，"
+            f"工具 {payload.get('tool_count', 0)} 个"
+        )
+    if event == "tool_permission_resume_direct_answer":
+        return (
+            f"{prefix}权限恢复后直接回复："
+            f"{payload.get('answer_preview', '')}"
+        )
+    if event == "tool_permission_resume_missing":
+        return f"权限恢复失败：请求已失效 {payload.get('permission_id', '')}"
+    if event == "tool_permission_user_denied":
+        return f"{prefix}用户拒绝工具调用：{payload.get('name', '')}"
+    if event == "tool_permission_denied":
+        reason = str(payload.get("reason") or "")
+        reason_suffix = f"，原因：{reason}" if reason else ""
+        return f"{prefix}工具权限拒绝：{payload.get('tool_name', '')}{reason_suffix}"
     if event == "shell_command_start":
         return f"Shell 开始：{payload.get('command', '')} @ {payload.get('cwd', '')}"
     if event == "shell_command_complete":
@@ -405,6 +459,23 @@ def _stream_log_suffix(payload: dict[str, Any], stream: str) -> str:
     if not ref:
         return ""
     return f"（已截断，artifact={ref}）"
+
+
+def _permission_action_text(value: Any) -> str:
+    if value == "allow":
+        return "允许"
+    if value == "confirm":
+        return "需要确认"
+    if value == "deny":
+        return "拒绝"
+    return str(value or "未知")
+
+
+def _list_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    items = [str(item) for item in value if str(item)]
+    return ", ".join(items)
 
 
 def _compact_payload(payload: dict[str, Any]) -> str:

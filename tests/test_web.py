@@ -169,6 +169,44 @@ class RequestedToolProvider(FakeProvider):
         )
 
 
+class PermissionToolProvider(FakeProvider):
+    def __init__(self):
+        self.inputs = []
+        self.tools = []
+        self.calls = 0
+
+    def stream(self, input, **kwargs):
+        self.inputs.append(input)
+        self.tools.append(kwargs.get("tools"))
+        self.calls += 1
+        if any(message.get("role") == "tool" for message in input):
+            yield ModelStreamEvent(type="content_delta", delta="done")
+            yield ModelStreamEvent(
+                type="finish",
+                response=ModelResponse(
+                    content=None,
+                    finish_reason="stop",
+                    usage={"prompt_tokens": 20, "completion_tokens": 1},
+                ),
+            )
+            return
+        yield ModelStreamEvent(
+            type="finish",
+            response=ModelResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        id=f"call-write-{self.calls}",
+                        name="write_file",
+                        arguments={"path": "x.txt"},
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 12},
+            ),
+        )
+
+
 def weather_registry(result=None, handler=None):
     return ToolRegistry(
         [
@@ -202,6 +240,8 @@ def test_web_session_bootstrap_status(tmp_path):
     events = session.boot_events()
 
     assert events[0].type == "status"
+    assert events[0].payload["cwd"] == "未选择项目"
+    assert events[0].payload["cwdPath"] == ""
     assert events[0].payload["model"] == "fake-model"
     assert events[0].payload["context"].startswith("输入上下文：")
     assert events[0].payload["context"].endswith(" / 123.0k")
@@ -209,6 +249,12 @@ def test_web_session_bootstrap_status(tmp_path):
     assert events[0].payload["inputBudgetTokens"] == 123000
     assert events[0].payload["contextWindow"] == 128000
     assert events[0].payload["logFile"]
+
+
+def test_web_session_does_not_create_default_project(tmp_path):
+    session = make_session(tmp_path)
+
+    assert session.list_projects() == []
 
 
 def test_web_session_uses_configured_memory_store_as_sdk_component(tmp_path):
@@ -353,6 +399,7 @@ def test_fastapi_bootstrap_and_commands(tmp_path):
     commands = client.get("/api/commands")
 
     assert bootstrap.status_code == 200
+    assert bootstrap.json()["events"][0]["cwd"] == "未选择项目"
     assert bootstrap.json()["events"][0]["model"] == "fake-model"
     assert commands.status_code == 200
     assert {item["name"] for item in commands.json()["commands"]} == {
@@ -364,30 +411,59 @@ def test_fastapi_bootstrap_and_commands(tmp_path):
 
 def test_web_session_select_project_only_switches_project(tmp_path):
     session = make_session(tmp_path)
-    project = session.list_projects()[0]
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = session.add_project(project_dir)
 
     selected = session.select_project(project["id"])
 
     assert selected["project"]["id"] == project["id"]
     assert selected["conversations"] == []
+    assert selected["status"]["cwdPath"] == project["path"]
     assert session.list_conversations(project["id"]) == []
+
+
+def test_web_session_select_project_updates_shell_default_cwd(tmp_path):
+    project_dir = tmp_path / "selected-project"
+    project_dir.mkdir()
+    provider = RequestedToolProvider(
+        ToolCall(
+            id="call-shell",
+            name="shell_command",
+            arguments={"command": "pwd"},
+        )
+    )
+    session = make_session(tmp_path, provider=provider)
+    project = session.add_project(project_dir)
+    selected = session.select_project(project["id"])
+
+    events = list(session.submit("conversation-1", "where am I?"))
+
+    result = next(event for event in events if event.type == "tool_call_result")
+    assert selected["status"]["cwdPath"] == str(project_dir.resolve())
+    assert result.payload["result"]["cwd"] == str(project_dir.resolve())
+    assert result.payload["result"]["stdout"].strip() == str(project_dir.resolve())
 
 
 def test_web_session_project_conversations_are_scoped(tmp_path):
     session = make_session(tmp_path)
-    first = session.list_projects()[0]
-    second = session.project_store.ensure_project(tmp_path / "other")
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "other"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = session.add_project(first_dir)
+    second = session.add_project(second_dir)
 
     first_conversation = session.create_conversation(project_id=first["id"])
-    second_conversation = session.create_conversation(project_id=second.id)
+    second_conversation = session.create_conversation(project_id=second["id"])
 
     projects = {item["id"]: item for item in session.list_projects()}
     assert projects[first["id"]]["conversationCount"] == 1
-    assert projects[second.id]["conversationCount"] == 1
+    assert projects[second["id"]]["conversationCount"] == 1
     assert [item["id"] for item in session.list_conversations(first["id"])] == [
         first_conversation["id"]
     ]
-    assert [item["id"] for item in session.list_conversations(second.id)] == [
+    assert [item["id"] for item in session.list_conversations(second["id"])] == [
         second_conversation["id"]
     ]
 
@@ -422,14 +498,17 @@ def test_web_session_delete_project_removes_project_without_deleting_conversatio
 def test_fastapi_projects_select_endpoint_switches_project(tmp_path):
     session = make_session(tmp_path)
     client = TestClient(create_app(session=session))
-    project_id = client.get("/api/projects").json()["items"][0]["id"]
+    project_dir = tmp_path / "select-api-project"
+    project_dir.mkdir()
+    project = client.post("/api/projects", json={"path": str(project_dir)}).json()
 
-    response = client.post("/api/projects/select", json={"project_id": project_id})
+    response = client.post("/api/projects/select", json={"project_id": project["id"]})
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["project"]["id"] == project_id
+    assert payload["project"]["id"] == project["id"]
     assert payload["conversations"] == []
+    assert payload["status"]["cwdPath"] == str(project_dir.resolve())
 
 
 def test_fastapi_projects_create_endpoint_adds_project(tmp_path):
@@ -726,6 +805,7 @@ def test_web_session_exposes_agent_core_tools_by_default(tmp_path):
         "skill_read",
         "skill_read_resource",
         "shell_command",
+        "apply_patch",
     }.issubset(tool_names)
 
 
@@ -798,6 +878,97 @@ def test_web_session_executes_shell_tool_via_agent_core(tmp_path):
     assert result.payload["name"] == "shell_command"
     assert result.payload["result"]["exit_code"] == 0
     assert result.payload["result"]["stdout"] == "web-core"
+
+
+def test_web_session_permission_confirmation_resumes_without_duplicate_user(tmp_path):
+    executed = []
+    provider = PermissionToolProvider()
+    registry = ToolRegistry(
+        [
+            ToolSpec(
+                name="write_file",
+                description="Write a file.",
+                input_schema={"type": "object"},
+                handler=lambda arguments: executed.append(arguments) or {"ok": True},
+                effects=["write"],
+            )
+        ]
+    )
+    session = make_session(tmp_path, provider=provider, tool_registry=registry)
+
+    first_events = list(session.submit("conversation-1", "write file"))
+
+    assert [event.type for event in first_events] == [
+        "user_message",
+        "permission_request",
+        "notice",
+    ]
+    assert first_events[1].payload["tool_name"] == "write_file"
+    permission_id = first_events[1].payload["permission_id"]
+    assert executed == []
+    assert [
+        message.role
+        for message in session.memory_store.list_messages("conversation-1")
+    ] == ["user"]
+
+    approved_events = list(
+        session.submit(
+            "conversation-1",
+            "write file",
+            permission_profile="full_access",
+            permission_approved=True,
+            permission_id=permission_id,
+        )
+    )
+
+    assert "user_message" not in [event.type for event in approved_events]
+    result = next(event for event in approved_events if event.type == "tool_call_result")
+    assert result.payload["name"] == "write_file"
+    assert result.payload["status"] == "completed"
+    assert executed == [{"path": "x.txt"}]
+    assert provider.calls == 1
+    assistant = next(event for event in approved_events if event.type == "assistant_delta")
+    assert assistant.payload["text"] == "操作已完成。"
+    assert [
+        message.role
+        for message in session.memory_store.list_messages("conversation-1")
+    ] == ["user", "assistant", "tool", "assistant"]
+
+
+def test_web_session_permission_denial_records_tool_result(tmp_path):
+    executed = []
+    provider = PermissionToolProvider()
+    registry = ToolRegistry(
+        [
+            ToolSpec(
+                name="write_file",
+                description="Write a file.",
+                input_schema={"type": "object"},
+                handler=lambda arguments: executed.append(arguments) or {"ok": True},
+                effects=["write"],
+            )
+        ]
+    )
+    session = make_session(tmp_path, provider=provider, tool_registry=registry)
+
+    first_events = list(session.submit("conversation-1", "write file"))
+    permission_id = first_events[1].payload["permission_id"]
+    denied_events = list(
+        session.submit(
+            "conversation-1",
+            "write file",
+            permission_denied=True,
+            permission_id=permission_id,
+        )
+    )
+
+    assert executed == []
+    result = next(event for event in denied_events if event.type == "tool_call_result")
+    assert result.payload["status"] == "denied"
+    assert [
+        message.role
+        for message in session.memory_store.list_messages("conversation-1")
+    ] == ["user", "assistant", "tool"]
 
 
 def test_web_session_restores_assistant_execution_steps(tmp_path):
